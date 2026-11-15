@@ -296,6 +296,7 @@ async def respawn_due(
                 meeting_url=data.get("constructed_meeting_url"),
                 recording_enabled=bool(data.get("recording_enabled", False)),
                 transcribe_enabled=bool(data.get("transcribe_enabled", True)),
+                voice_agent_enabled=bool(data.get("voice_agent_enabled", False)),
                 token_secret=token_secret,
                 redis_url=redis_url,
                 redis_grant=redis_grant,
