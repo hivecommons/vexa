@@ -1,0 +1,120 @@
+# quorum-upstream-sync: keep hivecommons/vexa current with upstream Vexa-ai/vexa.
+#
+# 1. Merge upstream `main` into our `main` with a merge commit (bot identity, Signed-off-by
+#    trailer). Never rebases or force-pushes main; our patches live on main as merged PRs.
+#    On conflict nothing is pushed to main: upstream main is pushed to `sync/upstream-<date>`
+#    and the "Upstream sync conflict" PR (opened or updated) lists the conflicting files, so
+#    hive's hive, which watches hivecommons/vexa, picks it up.
+# 2. Re-disable upstream workflows: any registered workflow whose file is not
+#    `.github/workflows/quorum-*` is disabled (new upstream workflows register when they land
+#    on main).
+# 3. Mirror releases: if the latest upstream (non-prerelease) release has no
+#    `ghcr.io/hivecommons/vexa-bot:<tag>-quorum.1` image yet, dispatch quorum-images.yml for
+#    it. That build is "upstream tag + our patches": the tag from Vexa-ai/vexa with the net
+#    diff of our main against its merge-base with upstream/main applied on top (excluding
+#    .github/). Details: .github/quorum/README.md. Cluster upgrades are NOT automated: the
+#    hivecommons/quorum Helm values pin exact tags, bumped by PR.
+#
+# Token: pushes use secrets.QUORUM_SYNC_TOKEN when set, else GITHUB_TOKEN. GITHUB_TOKEN cannot
+# push commits that change files under .github/workflows/ (GitHub requires the `workflows`
+# scope), so an upstream merge that touches upstream workflow files needs QUORUM_SYNC_TOKEN
+# (fine-grained token, this repo only: contents + workflows + pull-requests read/write).
+name: quorum-upstream-sync
+
+on:
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+  packages: read
+
+concurrency:
+  group: quorum-upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: https://github.com/Vexa-ai/vexa.git
+  UPSTREAM_API: repos/Vexa-ai/vexa
+  IMAGE_NS: ghcr.io/hivecommons
+  BOT_NAME: github-actions[bot]
+  BOT_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+  # Seconds to wait for GitHub to register workflows that a merge just added to main.
+  WORKFLOW_REGISTER_WAIT_SECONDS: 30
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: repo
+    steps:
+      # Our scripts, from the commit this workflow runs at (main, or a branch when dispatched).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tools
+          sparse-checkout: .github/quorum
+          persist-credentials: false
+      # The branch we merge into: always main.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          path: repo
+          fetch-depth: 0
+          token: ${{ secrets.QUORUM_SYNC_TOKEN || github.token }}
+
+      - name: Merge upstream main
+        id: sync
+        env:
+          GH_TOKEN: ${{ secrets.QUORUM_SYNC_TOKEN || github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: bash ../tools/.github/quorum/upstream-sync.sh
+
+      - name: Mirror upstream release tags (best effort)
+        if: steps.sync.outputs.result == 'merged'
+        run: |
+          for t in $(git tag --merged HEAD --list 'v*' | sort -V | tail -20); do
+            git ls-remote --exit-code --tags origin "refs/tags/$t" >/dev/null 2>&1 \
+              || git push origin "refs/tags/$t" || echo "::warning ::could not push tag $t"
+          done
+
+      - name: Keep upstream workflows disabled
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if [ "${{ steps.sync.outputs.result }}" = "merged" ]; then sleep "$WORKFLOW_REGISTER_WAIT_SECONDS"; fi
+          bash ../tools/.github/quorum/disable-upstream-workflows.sh
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build images for a new upstream release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          TAG="$(gh api "$UPSTREAM_API/releases/latest" -q .tag_name)"
+          if docker buildx imagetools inspect "$IMAGE_NS/vexa-bot:$TAG-quorum.1" >/dev/null 2>&1; then
+            echo "latest upstream release $TAG already built"
+          else
+            gh workflow run quorum-images.yml --ref main -f ref="$TAG"
+            echo "::notice ::dispatched quorum-images.yml for upstream release $TAG"
+          fi
+
+      - name: Summary
+        run: |
+          {
+            echo "## quorum-upstream-sync"
+            echo "- result: ${{ steps.sync.outputs.result }}"
+            echo "- upstream commits pulled: ${{ steps.sync.outputs.pulled }}"
+          } >> "$GITHUB_STEP_SUMMARY"
