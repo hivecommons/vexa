@@ -203,3 +203,221 @@ export function createTeamsChat(opts: TeamsChatOptions): TeamsChat {
     },
   };
 }
+
+// ── Chat SEND (acts.v1 `chat_send` on teams) ──────────────────────────────────────────────────
+//
+// The bot writes a line into the meeting chat the way a participant does: open the chat panel when
+// it is closed, find the composer (Teams' rich-text editor, a contenteditable — never an <input>),
+// put the text in, press the send button of the composer's own row (or Enter), and count the send
+// only once a message body reading exactly that text shows in the message list. Two drivers share
+// these primitives: the bot's TRUSTED path (prepareTeamsChatSend marks the composer and the send
+// button, Playwright fills and clicks them, awaitTeamsChatLanded checks the landing) and the
+// page-side fallback (sendTeamsChatMessage: insertText + click / synthetic Enter).
+
+/** The chat panel toggle in the meeting's control bar, most-specific first. */
+export const teamsChatToggleSelectors: string[] = [
+  '#chat-button',
+  '[data-tid="chat-button"]',
+  'button[data-inp="chat-button"]',
+  '[data-tid="toggle-chat"]',
+];
+
+/** The chat composer: Teams' editor, most-specific first. Only shown, editable fields count. */
+export const teamsChatComposerSelectors: string[] = [
+  '[data-tid="ckeditor"][contenteditable="true"]',
+  '[data-tid="ckeditor-replyConversation"][contenteditable="true"]',
+  'div[contenteditable="true"][role="textbox"]',
+  '[contenteditable="true"][aria-label*="message" i]',
+];
+
+/** The send button, looked for in the composer's own row, most-specific first. */
+export const teamsChatSendSelectors: string[] = [
+  '[data-tid="newMessageCommands-send"]',
+  'button[name="send"]',
+  'button[data-tid*="send" i]',
+  'button[aria-label*="send" i]',
+];
+
+/** Attributes the bot's trusted-input path addresses the composer and the send button by (the same
+ *  names the Meet sender marks, so one Playwright driver serves both). */
+export const TEAMS_CHAT_COMPOSER_MARK = 'data-vexa-chat-composer';
+export const TEAMS_CHAT_SEND_MARK = 'data-vexa-chat-send';
+
+export type TeamsChatSendFailure = 'no_composer' | 'not_landed' | 'empty_text';
+export type TeamsChatSendResult =
+  | { ok: true; composer: string; send: string }
+  | { ok: false; reason: TeamsChatSendFailure };
+
+interface TeamsChatHit { el: HTMLElement; via: string }
+
+const normalizeLine = (t: string): string => t.replace(/\s+/g, ' ').trim();
+
+const teamsIsShown = (el: Element): boolean => {
+  for (let cur: Element | null = el; cur; cur = cur.parentElement) {
+    if (cur.hasAttribute('hidden') || cur.getAttribute('aria-hidden') === 'true') return false;
+  }
+  return true;
+};
+
+const teamsIsDisabled = (el: Element): boolean =>
+  el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true';
+
+/** The visible chat composer, or null when the panel is closed. */
+export function findTeamsChatComposer(): TeamsChatHit | null {
+  for (const sel of teamsChatComposerSelectors) {
+    const el = Array.from(document.querySelectorAll(sel)).find((e) => teamsIsShown(e) && !teamsIsDisabled(e));
+    if (el) return { el: el as HTMLElement, via: sel };
+  }
+  return null;
+}
+
+/** The send button of `composer`'s own row: climb from the composer to the nearest ancestor holding
+ *  a matching button. Searching outward from the composer keeps the meeting toolbar out of reach.
+ *  null means "press Enter". */
+export function findTeamsChatSendButton(composer: Element): TeamsChatHit | null {
+  for (let cur: Element | null = composer.parentElement, i = 0; cur && i < 6; cur = cur.parentElement, i++) {
+    for (const sel of teamsChatSendSelectors) {
+      const el = cur.querySelector(sel);
+      if (el && teamsIsShown(el)) return { el: el as HTMLElement, via: sel };
+    }
+  }
+  return null;
+}
+
+/** The chat panel toggle, or null. */
+export function findTeamsChatToggle(): TeamsChatHit | null {
+  for (const sel of teamsChatToggleSelectors) {
+    const el = document.querySelector(sel);
+    if (el) return { el: el as HTMLElement, via: sel };
+  }
+  return null;
+}
+
+/** Open the chat panel when it is closed. True when the composer is already there or a toggle was
+ *  clicked; false when neither is in the DOM. A toggle that says it is pressed is not clicked (that
+ *  would close a panel that is still mounting). */
+export function openTeamsChatPanel(): boolean {
+  if (findTeamsChatComposer()) return true;
+  const toggle = findTeamsChatToggle();
+  if (!toggle) return false;
+  if (toggle.el.getAttribute('aria-pressed') === 'true') return true;
+  toggle.el.click();
+  return true;
+}
+
+const teamsSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+async function awaitTeamsComposer(waitMs: number): Promise<TeamsChatHit | null> {
+  let composer = findTeamsChatComposer();
+  if (!composer && openTeamsChatPanel()) {
+    const deadline = Date.now() + waitMs;
+    while (!composer && Date.now() < deadline) {
+      await teamsSleep(100);
+      composer = findTeamsChatComposer();
+    }
+  }
+  return composer;
+}
+
+/** The texts of the message bodies in the chat list (the matched list, else the whole page). */
+function teamsChatLines(): string[] {
+  let root: ParentNode = document;
+  for (const sel of CONTAINER_SELECTORS) {
+    const el = document.querySelector(sel);
+    if (el) { root = el; break; }
+  }
+  for (const sel of TEXT_SELECTORS) {
+    const nodes = Array.from(root.querySelectorAll(sel));
+    if (nodes.length) return nodes.map((n) => normalizeLine(n.textContent || ''));
+  }
+  return [];
+}
+
+/** How many message bodies read exactly `text` now: the baseline a landing check compares against,
+ *  so a repeat of an earlier line is told apart from the new one. */
+export function countTeamsChatLines(text: string): number {
+  const want = normalizeLine(text);
+  return teamsChatLines().filter((t) => t === want).length;
+}
+
+/** Wait (up to `waitMs`) for one more message body reading `text` than `before`. */
+export async function awaitTeamsChatLanded(text: string, before: number, waitMs = 8000): Promise<boolean> {
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    if (countTeamsChatLines(text) > before) return true;
+    if (Date.now() >= deadline) return false;
+    await teamsSleep(Math.min(150, Math.max(1, deadline - Date.now())));
+  }
+}
+
+/** Prepare a TRUSTED send driven from outside the page (Playwright fill + click / Enter): open the
+ *  panel, find the composer and its send button, mark them, and return which selector found each
+ *  (null when absent) plus `before` for awaitTeamsChatLanded. */
+export async function prepareTeamsChatSend(
+  text: string,
+  opts: { log?: (m: string) => void; waitMs?: number } = {},
+): Promise<{ composer: string | null; send: string | null; before: number }> {
+  const log = opts.log || (() => {});
+  for (const m of Array.from(document.querySelectorAll(`[${TEAMS_CHAT_COMPOSER_MARK}], [${TEAMS_CHAT_SEND_MARK}]`))) {
+    m.removeAttribute(TEAMS_CHAT_COMPOSER_MARK);
+    m.removeAttribute(TEAMS_CHAT_SEND_MARK);
+  }
+  const composer = await awaitTeamsComposer(opts.waitMs ?? 3000);
+  if (!composer) { log('chat send: no visible Teams chat composer (panel would not open)'); return { composer: null, send: null, before: 0 }; }
+  composer.el.setAttribute(TEAMS_CHAT_COMPOSER_MARK, '1');
+  const send = findTeamsChatSendButton(composer.el);
+  if (send) send.el.setAttribute(TEAMS_CHAT_SEND_MARK, '1');
+  const before = countTeamsChatLines(text);
+  log(`chat send: composer via ${composer.via}, send button via ${send?.via ?? 'none (Enter)'}`);
+  return { composer: composer.via, send: send?.via ?? null, before };
+}
+
+/** Put `text` into a contenteditable composer through the editor's own input path (insertText),
+ *  which rich editors observe; value assignment would be ignored. */
+function insertTeamsText(el: HTMLElement, text: string): void {
+  el.focus();
+  const doc = document as Document & { execCommand?: (c: string, u?: boolean, v?: string) => boolean };
+  let inserted = false;
+  try { inserted = !!doc.execCommand?.('insertText', false, text); } catch { inserted = false; }
+  if (!inserted) {
+    const fire = (type: string, cancelable: boolean) => el.dispatchEvent(typeof InputEvent === 'function'
+      ? new InputEvent(type, { inputType: 'insertText', data: text, bubbles: true, cancelable })
+      : new Event(type, { bubbles: true, cancelable }));
+    fire('beforeinput', true);
+    el.textContent = text;
+    fire('input', false);
+  }
+}
+
+/** Write `text` into the Teams meeting chat from INSIDE the page: open the panel if needed, insert
+ *  the text, click the row's send button, else press Enter, then wait (up to `landWaitMs`) for the
+ *  line to show in the message list. ok only once it does. */
+export async function sendTeamsChatMessage(
+  text: string,
+  opts: { log?: (m: string) => void; waitMs?: number; landWaitMs?: number } = {},
+): Promise<TeamsChatSendResult> {
+  const log = opts.log || (() => {});
+  if (!normalizeLine(text)) return { ok: false, reason: 'empty_text' };
+  const composer = await awaitTeamsComposer(opts.waitMs ?? 3000);
+  if (!composer) { log('chat send: no visible Teams chat composer'); return { ok: false, reason: 'no_composer' }; }
+  const before = countTeamsChatLines(text);
+  insertTeamsText(composer.el, text);
+  const send = findTeamsChatSendButton(composer.el);
+  let how: string;
+  if (send && !teamsIsDisabled(send.el)) {
+    send.el.click();
+    how = `click (${send.via})`;
+  } else {
+    const key = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true };
+    for (const type of ['keydown', 'keyup']) {
+      composer.el.dispatchEvent(typeof KeyboardEvent === 'function' ? new KeyboardEvent(type, key) : new Event(type, key));
+    }
+    how = 'Enter';
+  }
+  if (await awaitTeamsChatLanded(text, before, opts.landWaitMs ?? 8000)) {
+    log(`chat send: sent via ${how}, composer via ${composer.via}`);
+    return { ok: true, composer: composer.via, send: how };
+  }
+  log(`chat send: ${how} — the line did not show in the message list`);
+  return { ok: false, reason: 'not_landed' };
+}

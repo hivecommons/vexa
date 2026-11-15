@@ -21,7 +21,7 @@ Refusals, in the order they are checked:
     (``regime.LIVE_BOT_VERBS``). A line in the meeting speaks for the person, so only they, or a
     turn they are watching, send one.
   * ``422`` — the platform is not in the sealed ``Platform`` enum, its bot has no chat sender (only
-    ``google_meet`` and ``jitsi`` do), or the body is not an object carrying a non-blank string
+    ``google_meet``, ``jitsi`` and ``teams`` do), or the body is not an object carrying a non-blank string
     ``text`` of at most ``MAX_CHAT_CHARS`` characters (the sealed ``ChatSendRequest``).
   * ``404`` — the caller has no live meeting row for ``(platform, native_meeting_id)``.
   * ``409`` — there is a row, but its bot is not in the meeting (still booting or waiting in the
@@ -61,9 +61,9 @@ from .stop_router import _SUPPORTED_PLATFORMS, CommandPublisher, _active_rows, _
 
 #: The platforms whose bot carries a chat sender (``services/bot`` ``createChatSender``). The others
 #: are in the ``Platform`` enum but nothing in their meeting would type the line.
-CHAT_PLATFORMS = frozenset({"google_meet", "jitsi"})
+CHAT_PLATFORMS = frozenset({"google_meet", "jitsi", "teams"})
 
-#: The longest line this route hands a bot. Meet and Jitsi chat lines are short; a bound here keeps
+#: The longest line this route hands a bot. Meet, Jitsi and Teams chat lines are short; a bound here keeps
 #: a megabyte of text from being typed into somebody's meeting by one call.
 MAX_CHAT_CHARS = 2000
 

@@ -21,7 +21,7 @@
  *   • createMixedAudioCapture(stream, onPcm)      — mixed lane (zoom/teams)
  *   • createCsrcPoll({ onTransition, … })         — mixed lane transport sensor (CSRC transitions)
  *   • createGmeetChat({ log, onMessage, selfName }) — gmeet chat reader → __vexaChatMessage
- *   • sendGmeetChatMessage(text) / sendJitsiChatMessage(text) — the acts.v1 chat_send senders
+ *   • sendGmeetChatMessage(text) / sendJitsiChatMessage(text) / sendTeamsChatMessage(text) — the acts.v1 chat_send senders
  *   • prepareGmeetChatSend(text)                  — marks the Meet composer + send for trusted input
  *   • awaitGmeetChatLanded(text, before, ms)      — a Meet send counts once its line is in the list
  * We additionally expose the rest of the gmeet capture surface
@@ -96,6 +96,9 @@ import {
 import {
   createTeamsSpeakers,
   createTeamsCaptions,
+  sendTeamsChatMessage,
+  prepareTeamsChatSend,
+  awaitTeamsChatLanded,
 } from ${JSON.stringify(TEAMS)};
 import {
   createZoomSpeakers,
@@ -130,6 +133,9 @@ const VexaBrowserUtils = {
   // ── teams lane (voice-level "blue-square" outline → speaker hints) ──
   createTeamsSpeakers,       // capture-bridge.ts: w.VexaBrowserUtils.createTeamsSpeakers
   createTeamsCaptions,       // capture-bridge.ts: w.VexaBrowserUtils.createTeamsCaptions (live CC → diagnostics)
+  sendTeamsChatMessage,      // capture-bridge.ts createChatSender: acts.v1 chat_send on teams (page-side fallback)
+  prepareTeamsChatSend,      // capture-bridge.ts createChatSender: marks composer + send for trusted input
+  awaitTeamsChatLanded,      // capture-bridge.ts createChatSender: the trusted send's landing check
   // ── zoom lane (active-speaker DOM watcher → 'dom-active' naming hints) ──
   createZoomSpeakers,        // capture-bridge.ts: w.VexaBrowserUtils.createZoomSpeakers
   createTrackNameResolver,   // capture-bridge.ts setupPerTrack: the pure channel↔name correlator
@@ -179,5 +185,6 @@ console.log('  - GmeetChannelBinder / createPcmCaptureNode');
 console.log('  - createGmeetChat / sendGmeetChatMessage / openGmeetChatPanel / prepareGmeetChatSend / awaitGmeetChatLanded');
 console.log('  - createMixedAudioCapture / installRemoteAudioHook / selectTeamsMixStreams / createCsrcPoll');
 console.log('  - createJitsiSpeakers / createJitsiChat / sendJitsiChatMessage');
-console.log('  - createTeamsSpeakers / createTeamsCaptions / createZoomSpeakers / createTrackNameResolver');
+console.log('  - createTeamsSpeakers / createTeamsCaptions / sendTeamsChatMessage / prepareTeamsChatSend / awaitTeamsChatLanded');
+console.log('  - createZoomSpeakers / createTrackNameResolver');
 console.log('  - window.performLeaveAction');

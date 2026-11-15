@@ -5,7 +5,8 @@
  * @vexa/mixed-capture-core); this module provides the WHO signal:
  *   - createTeamsSpeakers: watches Teams' voice-level "blue-square" outline to
  *     detect the active speaker → a mixed-capture.v1 `hint` (kind 'dom-outline').
- *   - createTeamsChat: reads the chat panel (content tier).
+ *   - createTeamsChat: reads the chat panel (content tier); sendTeamsChatMessage /
+ *     prepareTeamsChatSend write a line into it (acts.v1 chat_send).
  *   - createTeamsCaptions: reads Teams' live closed captions when they are ON —
  *     an ALTERNATIVE speaker-attribution SOURCE (Teams attributes each caption to
  *     a named participant itself). Best-effort and DIAGNOSTIC in this iteration:
@@ -52,8 +53,17 @@ export type {
   TeamsProducerDomTraceTileState,
   TeamsProducerDomTraceNameToken,
 } from './producer-dom-trace.js';
-export { createTeamsChat } from './teams-chat.js';
-export type { TeamsChat, TeamsChatMessage } from './teams-chat.js';
+export {
+  createTeamsChat,
+  sendTeamsChatMessage,
+  prepareTeamsChatSend,
+  awaitTeamsChatLanded,
+  openTeamsChatPanel,
+  findTeamsChatComposer,
+  findTeamsChatSendButton,
+  countTeamsChatLines,
+} from './teams-chat.js';
+export type { TeamsChat, TeamsChatMessage, TeamsChatSendResult, TeamsChatSendFailure } from './teams-chat.js';
 export { createTeamsCaptions, teamsCaptionSelectors } from './msteams-captions.js';
 export type {
   TeamsCaptions,
