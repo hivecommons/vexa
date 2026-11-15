@@ -1,57 +1,78 @@
 # quorum-images: multi-arch (linux/amd64 + linux/arm64) Vexa images for hivecommons Quorum.
 #
-# Why this exists: upstream Vexa publishes the control-plane images for both arches, but
-# vexaai/vexa-bot is amd64-only and there is no published CPU transcription image for v0.12.
-# hive-oke runs only arm64 nodes, so we build these three ourselves:
+# Why this exists: hive-oke runs only arm64 nodes. Upstream vexaai/vexa-bot is amd64-only, there
+# is no published CPU transcription image, and upstream control-plane images exist only for
+# upstream releases, not for our patched main. So we build every image the Helm chart uses:
 #
-#   ghcr.io/hivecommons/vexa-meet-join-env    core/meetings/modules/join/Dockerfile.env (bot base)
-#   ghcr.io/hivecommons/vexa-bot              core/meetings/services/bot/Dockerfile
-#   ghcr.io/hivecommons/vexa-transcription-cpu core/meetings/services/transcription/Dockerfile.cpu
-#                                              + .github/quorum/transcription-cpu.overlay.Dockerfile
+#   catalog: .github/quorum/images.json (build context + Dockerfile per image, after upstream's
+#   release build plan). Published as ghcr.io/hivecommons/<repository>:
+#     set "bot":     vexa-meet-join-env (bot base), vexa-bot, vexa-transcription-cpu
+#                    (Dockerfile.cpu + .github/quorum/transcription-cpu.overlay.Dockerfile)
+#     set "control": vexa-gateway, vexa-admin-api, vexa-meeting-api, vexa-runtime, vexa-mcp,
+#                    vexa-agent-api, vexa-agent-worker, vexa-credential-broker, vexa-flows,
+#                    vexa-terminal, vexa-crm, vexa-signals
 #
-# Source = upstream release tag + our patches (see .github/quorum/README.md):
-#   the tag is fetched from Vexa-ai/vexa, then the net diff of our commit against the upstream
-#   commit it last merged (merge-base with upstream/main, excluding .github/) is applied on top.
+# Two sources (input `source`):
+#   release  upstream release tag + our patches (see .github/quorum/README.md): the tag is
+#            fetched from Vexa-ai/vexa, then the net diff of our commit against the upstream
+#            commit it last merged (merge-base with upstream/main, excluding .github/) is applied
+#            on top. Input `images`: "bot" (default, the original three) or "all".
+#            Tags: <tag>-quorum.N, <tag>-<short sha>, <tag>-patch-<patch hash>.
+#   main     a commit of THIS fork as committed (input `ref`: branch or SHA, default main),
+#            every image. Tags: main-<short sha>-quorum (immutable; what deployments pin, with
+#            its digest) and, when the commit is the tip of main, the moving main-quorum (for
+#            humans only; never deploy it).
 #
 # The bot Dockerfile is used UNCHANGED: its `FROM vexa/meet-join-env:dev` is satisfied with a
-# buildx named build context pointing at the per-arch meet-join-env digest built in the same
-# job. Nothing in the bot hard-codes amd64 (the aws CLI installer already uses `uname -m`).
+# buildx named build context pointing at the per-arch meet-join-env digest built in the same job.
 #
-# Each arch builds natively (ubuntu-24.04 and ubuntu-24.04-arm runners) and pushes by digest;
-# the publish job stitches the per-arch digests into one manifest list per image. QEMU is set
-# up as well so a single-runner fallback (all platforms on one runner) keeps working.
+# Each image x arch is one job on a native runner (ubuntu-24.04 / ubuntu-24.04-arm) that pushes by
+# digest; the publish job stitches the per-arch digests into one manifest list per image, checks
+# both platforms are present, and writes the digests to the step summary and a `digests` artifact.
 #
-# Tags per image: <tag>-quorum.N, <tag>-<short sha>, <tag>-patch-<patch hash>.
-# Triggers: workflow_dispatch (input `ref`), push to main (builds the latest upstream release
-# with the new patch set; skipped when that patch set is already published), and dispatch from
-# quorum-upstream-sync.yml when upstream cuts a new release.
+# Triggers: workflow_dispatch; push to main (source=main for the pushed commit; skipped when that
+# commit is already published); dispatch from quorum-upstream-sync.yml (source=release) when
+# upstream cuts a new release.
 name: quorum-images
 
 on:
   workflow_dispatch:
     inputs:
+      source:
+        description: "release = upstream tag + our patches; main = a commit of this fork as committed"
+        type: choice
+        options: [release, main]
+        default: release
       ref:
-        description: "Upstream Vexa release tag to build (e.g. v0.12.28), or 'latest'"
+        description: "release: upstream tag (e.g. v0.12.28) or 'latest'. main: branch or SHA of this fork (default main)"
         required: true
         default: latest
+      images:
+        description: "release only: 'bot' (bot, bot base, CPU transcription) or 'all' (plus control plane). main builds all."
+        type: choice
+        options: [bot, all]
+        default: bot
       force:
-        description: "Rebuild even if this tag + patch set is already published"
+        description: "Rebuild even if this source is already published"
         type: boolean
         default: false
   push:
     branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - ".github/**"
 
 permissions:
   contents: read
   packages: write
 
 concurrency:
-  group: quorum-images-${{ github.ref }}-${{ inputs.ref || 'latest' }}
+  group: quorum-images-${{ inputs.source || 'main' }}-${{ inputs.ref || github.sha }}
   cancel-in-progress: false
 
 env:
   IMAGE_NS: ghcr.io/hivecommons
-  IMAGES: vexa-meet-join-env vexa-bot vexa-transcription-cpu
   UPSTREAM_REPO: https://github.com/Vexa-ai/vexa.git
   UPSTREAM_API: repos/Vexa-ai/vexa
   # faster-whisper model baked into the CPU transcription image (small keeps pace on CPU).
@@ -62,13 +83,17 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     outputs:
+      source: ${{ steps.plan.outputs.source }}
       tag: ${{ steps.plan.outputs.tag }}
       base: ${{ steps.plan.outputs.base }}
+      sha: ${{ steps.plan.outputs.sha }}
       phash: ${{ steps.plan.outputs.phash }}
       short: ${{ steps.plan.outputs.short }}
-      rev: ${{ steps.plan.outputs.rev }}
       version: ${{ steps.plan.outputs.version }}
+      tags: ${{ steps.plan.outputs.tags }}
       skip: ${{ steps.plan.outputs.skip }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+      repositories: ${{ steps.plan.outputs.repositories }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -82,45 +107,59 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: plan
         env:
-          REF_INPUT: ${{ inputs.ref || 'latest' }}
+          # A push to main builds the pushed commit from main.
+          SOURCE: ${{ inputs.source || 'main' }}
+          REF_INPUT: ${{ inputs.ref || github.sha }}
+          IMAGE_SET: ${{ inputs.images || 'bot' }}
           FORCE: ${{ inputs.force || 'false' }}
+          CATALOG: .github/quorum/images.json
           GH_TOKEN: ${{ github.token }}
         run: bash .github/quorum/plan.sh
 
   build:
     needs: plan
     if: needs.plan.outputs.skip != 'true'
-    name: build ${{ matrix.arch }}
-    runs-on: ${{ matrix.runner }}
+    name: build ${{ matrix.image.name }} ${{ matrix.platform.arch }}
+    runs-on: ${{ matrix.platform.runner }}
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arch: amd64
-            platform: linux/amd64
-            runner: ubuntu-24.04
-          - arch: arm64
-            platform: linux/arm64
-            runner: ubuntu-24.04-arm
+        image: ${{ fromJSON(needs.plan.outputs.matrix) }}
+        platform:
+          - { arch: amd64, platform: linux/amd64, runner: ubuntu-24.04 }
+          - { arch: arm64, platform: linux/arm64, runner: ubuntu-24.04-arm }
     env:
+      SOURCE: ${{ needs.plan.outputs.source }}
       TAG: ${{ needs.plan.outputs.tag }}
+      SHA: ${{ needs.plan.outputs.sha }}
       VERSION: ${{ needs.plan.outputs.version }}
       SRC: ${{ github.workspace }}/src
+      DIGESTS: ${{ github.workspace }}/digests
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Free runner disk (the bot image is large)
+      - name: Free runner disk (large image)
+        if: matrix.image.free_disk == true
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
           df -h /
-      - name: Prepare source (upstream tag + hivecommons patches)
-        run: bash .github/quorum/prepare-source.sh "$TAG" "${{ needs.plan.outputs.base }}" "$SRC"
-      - name: Compose the CPU transcription Dockerfile
+      - name: Prepare source
         run: |
-          cat "$SRC/core/meetings/services/transcription/Dockerfile.cpu" \
+          set -euo pipefail
+          if [ "$SOURCE" = main ]; then
+            echo "building hivecommons/vexa $SHA as committed"
+            git worktree add --detach "$SRC" "$SHA"
+          else
+            bash .github/quorum/prepare-source.sh "$TAG" "${{ needs.plan.outputs.base }}" "$SRC"
+          fi
+          mkdir -p "$DIGESTS"
+      - name: Compose the CPU transcription Dockerfile
+        if: matrix.image.kind == 'stt'
+        run: |
+          cat "$SRC/${{ matrix.image.dockerfile }}" \
               .github/quorum/transcription-cpu.overlay.Dockerfile \
               > "$RUNNER_TEMP/transcription-cpu.Dockerfile"
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
@@ -131,26 +170,29 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # ---- kind: bot (vexa-meet-join-env, then vexa-bot FROM that digest) ----
       - name: Build vexa-meet-join-env
         id: env
+        if: matrix.image.kind == 'bot'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ${{ env.SRC }}/core/meetings/modules/join
           file: ${{ env.SRC }}/core/meetings/modules/join/Dockerfile.env
-          platforms: ${{ matrix.platform }}
+          platforms: ${{ matrix.platform.platform }}
           provenance: false
           labels: |
             org.opencontainers.image.source=https://github.com/hivecommons/vexa
+            org.opencontainers.image.revision=${{ env.SHA }}
             org.opencontainers.image.version=${{ env.VERSION }}
           outputs: type=image,name=${{ env.IMAGE_NS }}/vexa-meet-join-env,push-by-digest=true,name-canonical=true,push=true
-
       - name: Build vexa-bot
         id: bot
+        if: matrix.image.kind == 'bot'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ${{ env.SRC }}
           file: ${{ env.SRC }}/core/meetings/services/bot/Dockerfile
-          platforms: ${{ matrix.platform }}
+          platforms: ${{ matrix.platform.platform }}
           provenance: false
           # Satisfies the Dockerfile's `FROM vexa/meet-join-env:dev` with the digest built above.
           build-contexts: |
@@ -159,49 +201,84 @@ jobs:
             VEXA_IMAGE_VERSION=${{ env.VERSION }}
           labels: |
             org.opencontainers.image.source=https://github.com/hivecommons/vexa
+            org.opencontainers.image.revision=${{ env.SHA }}
             org.opencontainers.image.version=${{ env.VERSION }}
           outputs: type=image,name=${{ env.IMAGE_NS }}/vexa-bot,push-by-digest=true,name-canonical=true,push=true
 
+      # ---- kind: stt (CPU transcription, model baked in) ----
       - name: Build vexa-transcription-cpu
         id: stt
+        if: matrix.image.kind == 'stt'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ${{ env.SRC }}
           file: ${{ runner.temp }}/transcription-cpu.Dockerfile
-          platforms: ${{ matrix.platform }}
+          platforms: ${{ matrix.platform.platform }}
           provenance: false
           build-args: |
             MODEL_SIZE=${{ env.TRANSCRIPTION_MODEL_SIZE }}
           labels: |
             org.opencontainers.image.source=https://github.com/hivecommons/vexa
+            org.opencontainers.image.revision=${{ env.SHA }}
             org.opencontainers.image.version=${{ env.VERSION }}
           outputs: type=image,name=${{ env.IMAGE_NS }}/vexa-transcription-cpu,push-by-digest=true,name-canonical=true,push=true
 
+      # ---- kind: plain (one Dockerfile; the control-plane images) ----
+      - name: Build ${{ matrix.image.repository }}
+        id: plain
+        if: matrix.image.kind == 'plain'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ env.SRC }}/${{ matrix.image.context }}
+          file: ${{ env.SRC }}/${{ matrix.image.dockerfile }}
+          platforms: ${{ matrix.platform.platform }}
+          provenance: false
+          build-args: ${{ matrix.image.build_args || '' }}
+          cache-from: type=gha,scope=quorum-${{ matrix.image.name }}-${{ matrix.platform.arch }}
+          cache-to: type=gha,mode=max,ignore-error=true,scope=quorum-${{ matrix.image.name }}-${{ matrix.platform.arch }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/hivecommons/vexa
+            org.opencontainers.image.revision=${{ env.SHA }}
+            org.opencontainers.image.version=${{ env.VERSION }}
+          outputs: type=image,name=${{ env.IMAGE_NS }}/${{ matrix.image.repository }},push-by-digest=true,name-canonical=true,push=true
+
       - name: Record digests
+        env:
+          KIND: ${{ matrix.image.kind }}
+          ARCH: ${{ matrix.platform.arch }}
+          D_ENV: ${{ steps.env.outputs.digest }}
+          D_BOT: ${{ steps.bot.outputs.digest }}
+          D_STT: ${{ steps.stt.outputs.digest }}
+          D_PLAIN: ${{ steps.plain.outputs.digest }}
+          REPO: ${{ matrix.image.repository }}
         run: |
-          mkdir -p "$RUNNER_TEMP/digests"
-          {
-            echo "vexa-meet-join-env ${{ steps.env.outputs.digest }}"
-            echo "vexa-bot ${{ steps.bot.outputs.digest }}"
-            echo "vexa-transcription-cpu ${{ steps.stt.outputs.digest }}"
-          } > "$RUNNER_TEMP/digests/${{ matrix.arch }}.txt"
-          cat "$RUNNER_TEMP/digests/${{ matrix.arch }}.txt"
+          set -euo pipefail
+          out="$DIGESTS/${{ matrix.image.name }}-$ARCH.txt"
+          case "$KIND" in
+            bot)   printf 'vexa-meet-join-env %s %s\nvexa-bot %s %s\n' "$ARCH" "$D_ENV" "$ARCH" "$D_BOT" > "$out" ;;
+            stt)   printf 'vexa-transcription-cpu %s %s\n' "$ARCH" "$D_STT" > "$out" ;;
+            plain) printf '%s %s %s\n' "$REPO" "$ARCH" "$D_PLAIN" > "$out" ;;
+          esac
+          if awk 'NF != 3 || $3 !~ /^sha256:/ {bad=1} END {exit !bad}' "$out"; then
+            echo "::error ::missing digest"; cat "$out"; exit 1
+          fi
+          cat "$out"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: digests-${{ matrix.arch }}
-          path: ${{ runner.temp }}/digests/${{ matrix.arch }}.txt
+          name: digests-${{ matrix.image.name }}-${{ matrix.platform.arch }}
+          path: ${{ env.DIGESTS }}/${{ matrix.image.name }}-${{ matrix.platform.arch }}.txt
           if-no-files-found: error
           retention-days: 7
 
   publish:
     needs: [plan, build]
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     env:
-      TAG: ${{ needs.plan.outputs.tag }}
       VERSION: ${{ needs.plan.outputs.version }}
-      SHORT: ${{ needs.plan.outputs.short }}
-      PHASH: ${{ needs.plan.outputs.phash }}
+      TAGS: ${{ needs.plan.outputs.tags }}
+      REPOS: ${{ needs.plan.outputs.repositories }}
+      SHA: ${{ needs.plan.outputs.sha }}
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -218,25 +295,41 @@ jobs:
         run: |
           set -euo pipefail
           D="$RUNNER_TEMP/digests"
+          cat "$D"/*.txt > "$RUNNER_TEMP/all.txt"
+          OUT="$RUNNER_TEMP/published"; mkdir -p "$OUT"
           {
             echo "## quorum-images $VERSION"
             echo
-            echo "| image | tags | index digest | platforms |"
-            echo "|---|---|---|---|"
+            echo "source commit: \`$SHA\`; tags: \`$TAGS\`"
+            echo
+            echo "| image | pin | platforms (per-arch digest) |"
+            echo "|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
-          for img in $IMAGES; do
-            amd="$(awk -v i="$img" '$1==i{print $2}' "$D/amd64.txt")"
-            arm="$(awk -v i="$img" '$1==i{print $2}' "$D/arm64.txt")"
-            [ -n "$amd" ] && [ -n "$arm" ] || { echo "::error ::missing digest for $img"; exit 1; }
+          echo '[]' > "$OUT/digests.json"
+          for img in $REPOS; do
+            amd="$(awk -v i="$img" '$1==i && $2=="amd64" {print $3}' "$RUNNER_TEMP/all.txt")"
+            arm="$(awk -v i="$img" '$1==i && $2=="arm64" {print $3}' "$RUNNER_TEMP/all.txt")"
+            if [ -z "$amd" ] || [ -z "$arm" ]; then echo "::error ::missing digest for $img"; exit 1; fi
             ref="$IMAGE_NS/$img"
-            docker buildx imagetools create \
-              -t "$ref:$VERSION" -t "$ref:$TAG-$SHORT" -t "$ref:$TAG-patch-$PHASH" \
-              "$ref@$amd" "$ref@$arm"
-            docker buildx imagetools inspect "$ref:$VERSION"
-            idx="$(docker buildx imagetools inspect "$ref:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)"
-            plats="$(docker buildx imagetools inspect "$ref:$VERSION" --format '{{json .Manifest}}' \
-              | jq -r '[.manifests[].platform | "\(.os)/\(.architecture)"] | join(", ")')"
-            grep -q "linux/amd64" <<<"$plats" && grep -q "linux/arm64" <<<"$plats" \
-              || { echo "::error ::$img manifest lacks a platform: $plats"; exit 1; }
-            echo "| $ref | $VERSION, $TAG-$SHORT, $TAG-patch-$PHASH | $idx | $plats |" >> "$GITHUB_STEP_SUMMARY"
+            targs=(); for t in $TAGS; do targs+=(-t "$ref:$t"); done
+            docker buildx imagetools create "${targs[@]}" "$ref@$amd" "$ref@$arm"
+            manifest="$(docker buildx imagetools inspect "$ref:$VERSION" --format '{{json .Manifest}}')"
+            idx="$(jq -r .digest <<<"$manifest")"
+            plats="$(jq -r '[.manifests[] | "\(.platform.os)/\(.platform.architecture)=\(.digest)"] | join(", ")' <<<"$manifest")"
+            if ! grep -q "linux/amd64=" <<<"$plats" || ! grep -q "linux/arm64=" <<<"$plats"; then
+              echo "::error ::$img manifest lacks a platform: $plats"; exit 1
+            fi
+            echo "$ref:$VERSION@$idx  [$plats]"
+            echo "| $ref | \`$VERSION@$idx\` | $plats |" >> "$GITHUB_STEP_SUMMARY"
+            jq --arg r "$ref" --arg t "$VERSION" --arg d "$idx" --argjson m "$manifest" \
+              '. + [{repository: $r, tag: $t, digest: $d,
+                     platforms: [$m.manifests[] | {platform: "\(.platform.os)/\(.platform.architecture)", digest: .digest}]}]' \
+              "$OUT/digests.json" > "$OUT/tmp.json" && mv "$OUT/tmp.json" "$OUT/digests.json"
           done
+          cat "$OUT/digests.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digests
+          path: ${{ runner.temp }}/published/digests.json
+          if-no-files-found: error
+          retention-days: 90
