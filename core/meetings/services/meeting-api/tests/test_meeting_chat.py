@@ -86,8 +86,8 @@ def _message(meeting_id: int, segments: list[dict]) -> dict:
 # ── POST /bots/{platform}/{native}/chat → acts.v1 chat_send ─────────────────────────────────────
 
 
-def _seed(repo, *, status="active", native=NATIVE):
-    m = asyncio.run(repo.create_meeting(user_id=USER, platform=PLAT, native_meeting_id=native, data={}))
+def _seed(repo, *, status="active", native=NATIVE, platform=PLAT):
+    m = asyncio.run(repo.create_meeting(user_id=USER, platform=platform, native_meeting_id=native, data={}))
     sid = f"sess-{m['id']}"
     asyncio.run(repo.create_session(meeting_id=m["id"], session_uid=sid))
     if status != "requested":
@@ -123,6 +123,23 @@ def test_post_chat_publishes_a_chat_send_act_on_the_meetings_command_channel():
     assert channel == f"bot_commands:meeting:{m['id']}"
     act = json.loads(raw)
     assert act == {"action": "chat_send", "text": "hello room", "id": body["request_id"]}
+    ACT.validate(act)
+
+
+@pytest.mark.parametrize("platform", ["jitsi", "teams"])
+def test_post_chat_on_every_platform_with_a_chat_sender_publishes_the_act(platform):
+    """Each platform whose bot carries a chat sender (CHAT_PLATFORMS) is queued, not refused."""
+    client, repo, pub = _app()
+    m = _seed(repo, platform=platform)
+
+    r = client.post(f"/bots/{platform}/{NATIVE}/chat", headers=H, json={"text": "hello room"})
+
+    assert r.status_code == 200, r.text
+    assert len(pub.published) == 1
+    channel, raw = pub.published[0]
+    assert channel == f"bot_commands:meeting:{m['id']}"
+    act = json.loads(raw)
+    assert act == {"action": "chat_send", "text": "hello room", "id": r.json()["request_id"]}
     ACT.validate(act)
 
 
@@ -166,7 +183,7 @@ def test_post_chat_rejects_an_unsupported_platform_with_422():
     assert pub.published == []
 
 
-@pytest.mark.parametrize("platform", ["zoom", "teams", "vexa_call"])
+@pytest.mark.parametrize("platform", ["zoom", "vexa_call"])
 def test_post_chat_on_a_platform_whose_bot_has_no_chat_sender_is_422(platform):
     """In the Platform enum, but nothing in that meeting would type the line: refused, not queued."""
     client, repo, pub = _app()
