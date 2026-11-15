@@ -39,9 +39,7 @@ on:
         type: boolean
         default: false
   push:
-    # quorum/images: bootstrap only, so the workflow can run before it exists on main
-    # (workflow_dispatch needs the file on the default branch). Remove after merge.
-    branches: [main, quorum/images]
+    branches: [main]
 
 permissions:
   contents: read
