@@ -475,9 +475,22 @@ curl -X POST "$API_BASE/bots/google_meet/abc-defg-hij/speak" \
   -d '{"text":"Thanks everyone, wrapping up."}'
 ```
 
+```bash Stop speaking — DELETE /bots/{platform}/{native_meeting_id}/speak
+curl -X DELETE "$API_BASE/bots/google_meet/abc-defg-hij/speak" -H "X-API-Key: $API_KEY"
+```
+
 <Note>
-**Speak** (`POST …/speak`, TTS into the call) rides the live bot-control plane and is not yet wired in
-the open-core stack — it returns `404`. Everything else above is live.
+**Speak** needs a bot sent to speak: `POST /bots` with `"voice_agent_enabled": true`, on a deployment
+whose meeting-api has `TTS_SERVICE_URL` (an OpenAI-compatible `POST /v1/audio/speech` endpoint; its
+key in `TTS_API_TOKEN`; the stock compose and chart do not set them, so add them with a compose
+override or the chart's `extraEnv`). Without `TTS_SERVICE_URL`, `POST /bots` refuses `voice_agent_enabled` with
+`422`. `POST …/speak` takes `{"text": "…", "voice"?: "…"}` (at most 1000 characters; only the
+meeting's owner) and answers `200 {"status": "queued", "meeting_id", "native_meeting_id"}` once the
+bot has received the line: `404` with no live meeting, `409` before the bot is admitted, when the bot
+was not sent with `voice_agent_enabled`, or when no bot is listening, `422` for an empty or too-long
+`text` or for `audio_url` / `audio_base64` (pre-rendered audio is not played), `429` past 5 lines in
+30 seconds to one meeting (with `Retry-After`). `DELETE …/speak` stops the current line and answers
+`200 {"status": "stop_sent", "bots": <n>}`.
 </Note>
 
 ```bash List meetings — GET /meetings

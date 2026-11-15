@@ -21,11 +21,12 @@ import http from 'node:http';
 
 const PAPLAY_ARGS = ['--raw', '--format=s16le', '--rate=24000', '--channels=1', '--device=tts_sink'];
 
+/** Gate the bot's voice at tts_sink only. virtual_mic (the source Chromium captures) stays unmuted:
+ *  Meet shows a muted source as "Microphone problem" in place of the mic toggle. */
 function setTtsMute(muted: boolean, log: (m: string) => void): void {
   const v = muted ? '1' : '0';
   try {
     execSync(`pactl set-sink-mute tts_sink ${v}`, { stdio: 'pipe' });
-    execSync(`pactl set-source-mute virtual_mic ${v}`, { stdio: 'pipe' });
   } catch (err) {
     log(`[tts] pactl ${muted ? 'mute' : 'unmute'} failed: ${(err as Error).message}`);
   }

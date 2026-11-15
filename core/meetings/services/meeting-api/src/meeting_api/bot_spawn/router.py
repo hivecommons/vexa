@@ -117,6 +117,24 @@ def _resolve_recording_enabled(value: Optional[object]) -> bool:
         raise HTTPException(status_code=422, detail=str(e))
 
 
+def _resolve_voice_agent_enabled(value: Optional[object]) -> bool:
+    """Whether the bot may speak (acts.v1 ``speak``): off unless the request says ``true``. A bot
+    that speaks synthesizes through the TTS service meeting-api hands it (``TTS_SERVICE_URL``), so
+    asking for voice on a deployment with none configured is a 422 here — never a bot that accepts
+    ``/speak`` and stays silent."""
+    try:
+        enabled = resolve_spawn_flag("VOICE_AGENT_ENABLED", value, default=False,
+                                     field="voice_agent_enabled")
+    except InvalidFlagValue as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    if enabled and not (os.getenv("TTS_SERVICE_URL") or "").strip():
+        raise HTTPException(
+            status_code=422,
+            detail="voice_agent_enabled needs a TTS service: this deployment has no TTS_SERVICE_URL",
+        )
+    return enabled
+
+
 def _resolve_transcribe_enabled(value: Optional[object]) -> bool:
     """Transcription default for POST /bots — same shared resolver, same 422 skin (CC3)."""
     try:
@@ -667,6 +685,7 @@ def build_router(
                     transcription_tier=body.get("transcription_tier", "realtime"),
                     recording_enabled=_resolve_recording_enabled(body.get("recording_enabled")),
                     transcribe_enabled=transcribe_enabled,
+                    voice_agent_enabled=_resolve_voice_agent_enabled(body.get("voice_agent_enabled")),
                     automatic_leave=_resolve_automatic_leave(body.get("automatic_leave")),
                     # P3c — continue_meeting is accepted off the OPEN api.v1 request body (MeetingCreate
                     # has no additionalProperties:false), so the wire is not rejected; documenting it as

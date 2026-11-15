@@ -18,6 +18,7 @@ continue_meeting / max-bots / join-retry are P3 — NOT here; ``request_bot`` le
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Optional
 
@@ -101,6 +102,7 @@ def build_invocation(
     meeting_api_callback_url: Optional[str] = None,
     transcribe_enabled: bool = True,
     recording_enabled: bool = False,
+    voice_agent_enabled: bool = False,
     capture_modes: Optional[list[str]] = None,
     capture_signal_enabled: Optional[bool] = None,
     recording_upload_url: Optional[str] = None,
@@ -157,6 +159,9 @@ def build_invocation(
         # guard. The deployment's own endpoint is left unstated (an older bot refuses the field).
         "transcriptionServiceOwner": "customer" if transcription_service_owner == "customer" else None,
         "recordingEnabled": recording_enabled,
+        # Gates the acts.v1 voice commands in the bot. Sent only when on, so a bot that may not speak
+        # carries no voice field at all.
+        "voiceAgentEnabled": True if voice_agent_enabled else None,
         "captureModes": capture_modes,
         # O-TEL-1 (sealed invocation.v1 field): tee the raw captured-signal.v1 stream to durable
         # storage for offline replay. Orthogonal to recordingEnabled — the transcript and recording
@@ -198,6 +203,16 @@ def build_invocation(
     invocation = {k: v for k, v in invocation.items() if v is not None or k == "meetingUrl"}
     conforms_invocation(invocation)
     return invocation
+
+
+#: The TTS settings a speaking bot reads from its own environment (services/bot tts-playback.ts).
+TTS_ENV = ("TTS_SERVICE_URL", "TTS_API_TOKEN")
+
+
+def tts_workload_env() -> dict[str, str]:
+    """The TTS service meeting-api hands a bot sent with voice_agent_enabled, from meeting-api's own
+    environment: only the settings that are set."""
+    return {k: v for k in TTS_ENV if (v := (os.getenv(k) or "").strip())}
 
 
 def build_workload_spec(

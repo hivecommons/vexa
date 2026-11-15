@@ -1410,3 +1410,71 @@ def test_a_workers_default_into_a_read_only_workspace_stays_private(monkeypatch)
                        json={"platform": "google_meet", "native_meeting_id": "ro-aaaa-bbb"})
     assert r.status_code == 201, r.text
     assert "workspace_id" not in (r.json().get("data") or {})
+
+
+# ── voice_agent_enabled: the bot may speak only when sent to, and only with a TTS service ────────
+
+def test_post_bots_voice_agent_enabled_rides_invocation_row_and_tts_env(monkeypatch):
+    """`voice_agent_enabled: true` reaches all three places a speaking bot needs it: the invocation
+    (the bot's SpeakController gate), the workload env (the TTS service it synthesizes through) and
+    the row (what POST /speak checks before sending)."""
+    monkeypatch.setenv("ADMIN_TOKEN", SECRET)
+    monkeypatch.setenv("TRANSCRIPTION_SERVICE_URL", "https://stt.vexa.ai")
+    monkeypatch.setenv("TTS_SERVICE_URL", "http://tts:8002")
+    monkeypatch.setenv("TTS_API_TOKEN", "tts-tok")
+    repo, runtime = InMemoryMeetingRepo(), FakeRuntimeClient()
+    r = _client(repo, runtime).post("/bots", headers=HEADERS, json={
+        "platform": "google_meet", "native_meeting_id": "abc-defg-hij", "voice_agent_enabled": True})
+    assert r.status_code == 201, r.text
+    spec = runtime.specs[0]
+    conforms_workload_spec(spec)
+    inv = json.loads(spec["env"]["BOT_CONFIG"])
+    conforms_invocation(inv)
+    assert inv["voiceAgentEnabled"] is True
+    assert spec["env"]["TTS_SERVICE_URL"] == "http://tts:8002"
+    assert spec["env"]["TTS_API_TOKEN"] == "tts-tok"
+    row = list(repo._meetings.values())[0]
+    assert row["data"]["voice_agent_enabled"] is True
+
+
+def test_post_bots_without_voice_carries_no_voice_field_and_no_tts_env(monkeypatch):
+    """The default bot cannot speak: no voiceAgentEnabled in its invocation, no TTS credential in its
+    environment, and the row says false."""
+    monkeypatch.setenv("ADMIN_TOKEN", SECRET)
+    monkeypatch.setenv("TRANSCRIPTION_SERVICE_URL", "https://stt.vexa.ai")
+    monkeypatch.setenv("TTS_SERVICE_URL", "http://tts:8002")
+    monkeypatch.setenv("TTS_API_TOKEN", "tts-tok")
+    repo, runtime = InMemoryMeetingRepo(), FakeRuntimeClient()
+    r = _client(repo, runtime).post("/bots", headers=HEADERS,
+                                    json={"platform": "google_meet", "native_meeting_id": "abc-defg-hij"})
+    assert r.status_code == 201, r.text
+    spec = runtime.specs[0]
+    assert "voiceAgentEnabled" not in json.loads(spec["env"]["BOT_CONFIG"])
+    assert "TTS_SERVICE_URL" not in spec["env"] and "TTS_API_TOKEN" not in spec["env"]
+    assert list(repo._meetings.values())[0]["data"]["voice_agent_enabled"] is False
+
+
+def test_post_bots_voice_without_a_tts_service_is_422_and_spawns_nothing(monkeypatch):
+    """Asking for a bot that speaks on a deployment with no TTS service is refused up front: a bot
+    that accepts /speak and stays silent is the failure this guard exists for."""
+    monkeypatch.setenv("ADMIN_TOKEN", SECRET)
+    monkeypatch.setenv("TRANSCRIPTION_SERVICE_URL", "https://stt.vexa.ai")
+    monkeypatch.delenv("TTS_SERVICE_URL", raising=False)
+    repo, runtime = InMemoryMeetingRepo(), FakeRuntimeClient()
+    r = _client(repo, runtime).post("/bots", headers=HEADERS, json={
+        "platform": "google_meet", "native_meeting_id": "abc-defg-hij", "voice_agent_enabled": True})
+    assert r.status_code == 422, r.text
+    assert "TTS_SERVICE_URL" in r.json()["detail"]
+    assert runtime.specs == [] and repo._meetings == {}
+
+
+@pytest.mark.parametrize("value", ["sometimes", 3, ["yes"]])
+def test_post_bots_voice_flag_that_is_not_a_boolean_is_422(monkeypatch, value):
+    monkeypatch.setenv("ADMIN_TOKEN", SECRET)
+    monkeypatch.setenv("TRANSCRIPTION_SERVICE_URL", "https://stt.vexa.ai")
+    monkeypatch.setenv("TTS_SERVICE_URL", "http://tts:8002")
+    repo, runtime = InMemoryMeetingRepo(), FakeRuntimeClient()
+    r = _client(repo, runtime).post("/bots", headers=HEADERS, json={
+        "platform": "google_meet", "native_meeting_id": "abc-defg-hij", "voice_agent_enabled": value})
+    assert r.status_code == 422, r.text
+    assert runtime.specs == []

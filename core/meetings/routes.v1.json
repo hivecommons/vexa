@@ -160,6 +160,15 @@
       "shared": "refuse"
     },
     {
+      "method": "DELETE",
+      "path": "/bots/{platform}/{native_meeting_id}/speak",
+      "scopes": [
+        "bot",
+        "tx"
+      ],
+      "shared": "refuse"
+    },
+    {
       "method": "GET",
       "path": "/voice-notes/{native_meeting_id}/stream",
       "scopes": [

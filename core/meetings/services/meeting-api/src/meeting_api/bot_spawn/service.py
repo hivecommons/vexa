@@ -38,7 +38,7 @@ from ..service_authority import (
     ServiceAuthorityUnavailable,
 )
 from .auth_session import auth_session_config
-from .invocation import build_invocation, build_workload_spec, mint_meeting_token
+from .invocation import build_invocation, build_workload_spec, mint_meeting_token, tts_workload_env
 from .meeting_host import TEAMS_HOST_SUFFIXES, allowance_entries, check_meeting_url_async
 from . import transcription_language as tlang
 from .workload_redis import voice_note_stream
@@ -458,6 +458,9 @@ async def request_bot(
     transcribe_enabled: bool = True,
     automatic_leave: Optional[dict] = None,
     continue_meeting: bool = False,
+    # The bot may speak (acts.v1 `speak`): its invocation carries voiceAgentEnabled, its workload the
+    # TTS service it synthesizes through, and the row says so for the /speak route.
+    voice_agent_enabled: bool = False,
     max_concurrent: Optional[int] = None,
     redis_url: Optional[str] = None,
     meeting_api_url: Optional[str] = None,
@@ -829,6 +832,7 @@ async def request_bot(
             "transcription_language": transcription_language,
             "transcribe_enabled": transcribe_enabled,
             "recording_enabled": recording_enabled,
+            "voice_agent_enabled": voice_agent_enabled,
             "transcription_provider": transcription_provider,
             "service_authority": authority_record,
         }
@@ -851,6 +855,7 @@ async def request_bot(
             meeting_data["constructed_meeting_url"] = constructed_url
         meeting_data["transcribe_enabled"] = transcribe_enabled
         meeting_data["recording_enabled"] = recording_enabled
+        meeting_data["voice_agent_enabled"] = voice_agent_enabled
         # The setting the bot runs with, and which tier chose it. meeting-api is its one writer:
         # here, and on every accepted live change (lifecycle/reconfigure_router.py).
         meeting_data["transcription_language"] = transcription_language
@@ -975,6 +980,7 @@ async def request_bot(
         transcription_service_owner=("customer" if configured.get("url") and configured.get("provider") == "customer"
                                      else None),
         recording_enabled=recording_enabled,
+        voice_agent_enabled=voice_agent_enabled,
         capture_modes=(["audio", "video"] if recording_enabled else None),
         # O-TEL-1: the tape is INDEPENDENT of recording_enabled — a meeting the user never asked to
         # record still yields a fixture. Both ride the same upload endpoint below.
@@ -1036,6 +1042,7 @@ async def request_bot(
         workload_id=f"mtg-{meeting_id}-{connection_id[:8]}",
         invocation=invocation,
         callback_url=f"{meeting_api_url}/runtime/callback",
+        extra_env=tts_workload_env() if voice_agent_enabled else None,
         avoid_nodes=avoid_nodes,
     )
     try:

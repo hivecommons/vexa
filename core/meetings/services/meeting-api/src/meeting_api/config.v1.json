@@ -246,6 +246,28 @@
    ]
   },
   {
+   "key": "VOICE_AGENT_ENABLED",
+   "class": "defaulted",
+   "default": "false",
+   "description": "deployment-level default for a spawn's voice_agent_enabled when the request does not say: whether the bot may speak (acts.v1 speak, POST /bots/{platform}/{native_meeting_id}/speak). A bot sent with voice needs TTS_SERVICE_URL. Not plumbed by a stock deploy surface: set it with a compose override or helm extraEnv",
+   "targets": []
+  },
+  {
+   "key": "TTS_SERVICE_URL",
+   "class": "defaulted",
+   "default": "(unset — POST /bots refuses voice_agent_enabled with 422)",
+   "description": "TTS service base URL handed to a bot sent with voice_agent_enabled (its workload env; the bot POSTs /v1/audio/speech there and plays the audio into its microphone). Not plumbed by a stock deploy surface: set it with a compose override or helm extraEnv",
+   "targets": []
+  },
+  {
+   "key": "TTS_API_TOKEN",
+   "class": "defaulted",
+   "default": "(unset — the bot calls the TTS service without a key)",
+   "secret": true,
+   "description": "API key for TTS_SERVICE_URL (the bot sends it as X-API-Key), handed to a bot sent with voice_agent_enabled",
+   "targets": []
+  },
+  {
    "key": "BOT_AUTHENTICATED",
    "class": "defaulted",
    "default": "false",
