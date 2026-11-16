@@ -2,8 +2,27 @@
 
 Everything under `.github/quorum/` and every `.github/workflows/quorum-*.yml` file belongs to
 hivecommons. Upstream Vexa never ships files with these names, so upstream merges do not touch
-them. All other workflows in `.github/workflows/` come from upstream Vexa-ai/vexa and are kept
-DISABLED in this fork (they need upstream secrets and publish to upstream registries).
+them. `.github/workflows/` holds ONLY our `quorum-*` workflows: the fork does not keep or run
+upstream Vexa-ai/vexa workflows (they need upstream secrets and publish to upstream registries).
+
+## Upstream sync and workflow files
+
+The daily sync runs with the built-in `GITHUB_TOKEN`; no extra secret is needed. GitHub refuses
+a `GITHUB_TOKEN` push whose ref update changes files under `.github/workflows/`, so the sync
+never takes upstream workflow files:
+
+1. `git merge --no-commit --no-ff upstream/main`
+2. `keep_our_workflows` (`quorum/keep-our-workflows.sh`) resets `.github/workflows/` in the
+   index and work tree to exactly what our `main` has. Upstream-added workflows are dropped,
+   upstream edits are reverted, and a modify/delete conflict on an upstream workflow we deleted
+   is resolved by keeping it deleted.
+3. If no other conflicts remain, commit the merge, check that it changes no
+   `.github/workflows/` path, and push to `main`. Otherwise abort, push upstream main plus one
+   commit that applies the same reset to `sync/upstream-<date>`, and open or update the
+   "Upstream sync conflict" PR. Nothing is pushed to `main`.
+
+Only the pushed tip's tree counts: upstream commits in the merge's history may touch their
+workflows. Disabling non-`quorum-*` workflows stays in the sync as a safety net.
 
 | File | Purpose |
 |---|---|
@@ -14,7 +33,8 @@ DISABLED in this fork (they need upstream secrets and publish to upstream regist
 | `quorum/prepare-source.sh` | Materialises "upstream tag + our patches" into a build directory |
 | `quorum/transcription-cpu.overlay.Dockerfile` | Appended to upstream `Dockerfile.cpu`: bakes the Whisper model |
 | `quorum/upstream-sync.sh` | The merge logic used by the sync workflow |
-| `quorum/disable-upstream-workflows.sh` | Disables every registered workflow whose file is not `quorum-*` |
+| `quorum/keep-our-workflows.sh` | Resets `.github/workflows/` to our main during a sync merge |
+| `quorum/disable-upstream-workflows.sh` | Safety net: disables every registered workflow whose file is not `quorum-*` |
 
 ## Two sources
 

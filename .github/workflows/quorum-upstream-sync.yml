@@ -1,13 +1,13 @@
 # quorum-upstream-sync: keep hivecommons/vexa current with upstream Vexa-ai/vexa.
 #
 # 1. Merge upstream `main` into our `main` with a merge commit (bot identity, Signed-off-by
-#    trailer). Never rebases or force-pushes main; our patches live on main as merged PRs.
-#    On conflict nothing is pushed to main: upstream main is pushed to `sync/upstream-<date>`
-#    and the "Upstream sync conflict" PR (opened or updated) lists the conflicting files, so
+#    trailer), keeping our .github/workflows/ unchanged (see Token below). Never rebases or
+#    force-pushes main; our patches live on main as merged PRs.
+#    On conflict nothing is pushed to main: upstream main, plus one commit resetting
+#    .github/workflows/ to ours, is pushed to `sync/upstream-<date>` and the "Upstream sync conflict" PR (opened or updated) lists the conflicting files, so
 #    hive's hive, which watches hivecommons/vexa, picks it up.
-# 2. Re-disable upstream workflows: any registered workflow whose file is not
-#    `.github/workflows/quorum-*` is disabled (new upstream workflows register when they land
-#    on main).
+# 2. Safety net: any registered workflow whose file is not `.github/workflows/quorum-*` is
+#    disabled (none should exist, since the merge never brings upstream workflow files in).
 # 3. Mirror releases: if the latest upstream (non-prerelease) release has no
 #    `ghcr.io/hivecommons/vexa-bot:<tag>-quorum.1` image yet, dispatch quorum-images.yml for
 #    it. That build is "upstream tag + our patches": the tag from Vexa-ai/vexa with the net
@@ -15,10 +15,12 @@
 #    .github/). Details: .github/quorum/README.md. Cluster upgrades are NOT automated: the
 #    hivecommons/quorum Helm values pin exact tags, bumped by PR.
 #
-# Token: pushes use secrets.QUORUM_SYNC_TOKEN when set, else GITHUB_TOKEN. GITHUB_TOKEN cannot
-# push commits that change files under .github/workflows/ (GitHub requires the `workflows`
-# scope), so an upstream merge that touches upstream workflow files needs QUORUM_SYNC_TOKEN
-# (fine-grained token, this repo only: contents + workflows + pull-requests read/write).
+# Token: the built-in GITHUB_TOKEN only; no extra secret. GITHUB_TOKEN cannot push a ref
+# update that changes files under .github/workflows/, so the merge never takes them from
+# upstream: after `git merge --no-commit`, upstream-sync.sh resets .github/workflows/ to exactly
+# what our main has (upstream additions dropped, upstream edits reverted, upstream edits to files
+# we deleted stay deleted), then commits. The fork does not keep or run upstream workflows; only
+# ours (quorum-*) live there. The conflict branch gets the same reset on top of upstream main.
 name: quorum-upstream-sync
 
 on:
@@ -65,12 +67,11 @@ jobs:
           ref: main
           path: repo
           fetch-depth: 0
-          token: ${{ secrets.QUORUM_SYNC_TOKEN || github.token }}
 
       - name: Merge upstream main
         id: sync
         env:
-          GH_TOKEN: ${{ secrets.QUORUM_SYNC_TOKEN || github.token }}
+          GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: bash ../tools/.github/quorum/upstream-sync.sh
 
