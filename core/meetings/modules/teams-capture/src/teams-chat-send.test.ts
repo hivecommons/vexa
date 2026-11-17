@@ -8,11 +8,16 @@
  *   - the send counts only once a message body reading the text shows in the list (not_landed
  *     otherwise), and a line already in the list is told apart from the new one;
  *   - no composer → no_composer; blank text → empty_text, the page untouched;
- *   - the trusted path's marks land on the composer and the send button, and stale marks are cleared.
+ *   - the trusted path's marks land on the composer and the send button, and stale marks are cleared;
+ *   - the composer wait outlasts a control bar that mounts late, and gives up only after its budget;
+ *   - the reader (keepOpen) opens the panel, delivers participant lines with one log line each,
+ *     skips the bot's own lines, and re-opens a panel that closed.
  * The live Teams DOM is validated live.
  * Run: npx tsx src/teams-chat-send.test.ts   (the package's `npm test` chains it)
  */
 import {
+  createTeamsChat,
+  TEAMS_CHAT_REOPEN_MS,
   sendTeamsChatMessage,
   prepareTeamsChatSend,
   awaitTeamsChatLanded,
@@ -266,6 +271,61 @@ const logFn = (m: string) => log.push(m);
   const p = await prepareTeamsChatSend('slow panel', { waitMs: 2000 });
   check('prepare: a panel that mounts slowly after the click still yields the composer', p.composer !== null, JSON.stringify(p));
   check('prepare: the toggle was clicked once', f.toggle.clicks === 1, String(f.toggle.clicks));
+}
+
+
+// 13. The bot's chat READER: opens the panel itself, delivers participant lines (one log line each,
+//     body cut to 40 chars), never delivers the bot's own lines, and re-opens a panel that closed.
+{
+  const observers: Array<() => void> = [];
+  const intervals: Array<() => void> = [];
+  (globalThis as any).MutationObserver = class { constructor(private cb: () => void) {} observe() { observers.push(this.cb); } disconnect() { /* */ } };
+  (globalThis as any).window = { setInterval: (cb: () => void) => { intervals.push(cb); return intervals.length; }, clearInterval: () => { /* */ } };
+  const realNow = Date.now;
+  let skew = 0;
+  Date.now = () => realNow() + skew;
+  const mutate = () => observers.forEach((cb) => cb());
+  const tick = () => intervals.forEach((cb) => cb());
+
+  const f = fixture({ open: false });
+  const got: Array<{ sender: string; text: string }> = [];
+  const lines: string[] = [];
+  const reader = createTeamsChat({ selfName: 'Betty', keepOpen: true, log: (m) => lines.push(m), onMessage: (m) => got.push(m) });
+  check('reader: a closed panel is opened through the toggle at start', f.toggle.clicks === 1 && !!f.panel.parentElement, String(f.toggle.clicks));
+  tick();
+  check('reader: the message list is attached once the panel is open', lines.some((l) => l.startsWith('chat container matched:')), JSON.stringify(lines));
+
+  const long = 'betty, how many total issues are open in the hive repository right now?';
+  f.list.append(message('Andy Anderson', long));
+  mutate();
+  check('reader: a participant line is delivered with sender and full text',
+    got.length === 1 && got[0].sender === 'Andy Anderson' && got[0].text === long, JSON.stringify(got));
+  check('reader: one log line per message, body cut to 40 chars',
+    lines.filter((l) => l === `chat Andy Anderson: ${long.slice(0, 40)}`).length === 1, JSON.stringify(lines));
+
+  const sent = await sendTeamsChatMessage('Betty is taking notes for this meeting.', { landWaitMs: 50 });
+  mutate();
+  check('reader: the bot\'s own sent line is not delivered back', sent.ok === true && got.length === 1, JSON.stringify(got));
+  f.list.append(message('Betty', 'a line Teams attributes to the bot'));
+  mutate();
+  check('reader: a line under the bot\'s own name is not delivered', got.length === 1, JSON.stringify(got));
+
+  // Someone closes the panel: the reader re-opens it after the re-open gap, not before.
+  f.panel.parentElement!.kids = f.panel.parentElement!.kids.filter((k) => k !== f.panel);
+  f.panel.parentElement = null;
+  const clicksBefore = f.toggle.clicks;
+  tick();
+  check('reader: no re-open click inside the re-open gap', f.toggle.clicks === clicksBefore, String(f.toggle.clicks));
+  skew += TEAMS_CHAT_REOPEN_MS + 1;
+  tick();
+  check('reader: a closed panel is re-opened after the gap', f.toggle.clicks === clicksBefore + 1 && !!f.panel.parentElement, String(f.toggle.clicks));
+  check('reader: the re-open is logged', lines.some((l) => l.startsWith('chat panel re-opened via')), JSON.stringify(lines));
+  f.list.append(message('Andy Anderson', 'still there?'));
+  tick(); mutate();
+  check('reader: lines keep arriving after the re-open', got.length === 2 && got[1].text === 'still there?', JSON.stringify(got));
+
+  reader.destroy();
+  Date.now = realNow;
 }
 
 console.log(failed ? `\n❌ ${failed} check(s) failed` : '\n✅ teams-chat-send: all checks passed');

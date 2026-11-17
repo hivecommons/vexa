@@ -1233,6 +1233,22 @@ export async function startCaptureBridge(
         w.logBot?.('[Csrc] not in the browser bundle — continuing without transport observation');
       }
 
+      if (isTeams && w.VexaBrowserUtils?.createTeamsChat && !w.__vexaTeamsChat) {
+        // Teams chat reader: opens the meeting chat panel (and re-opens it if it closes), observes
+        // the message list, and sends each participant line across as a chat event. The bot's own
+        // lines (its display name, or a line it just sent) are not delivered back.
+        try {
+          w.__vexaTeamsChat = w.VexaBrowserUtils.createTeamsChat({
+            selfName: botName,
+            keepOpen: true,
+            log: (m: string) => w.logBot?.('[TeamsChat] ' + m),
+            onMessage: (m: { sender: string; text: string }) => w.__vexaChatMessage?.(m.sender, m.text),
+          });
+        } catch (e: any) {
+          w.__vexaTeamsChat = null;
+          w.logBot?.('[TeamsChat] init failed — continuing without the chat reader: ' + String(e));
+        }
+      }
       if (isTeams) {
         // Teams contributes the WHO signal the mixed audio can't carry: the voice-level
         // "blue-square" outline watcher (@vexa/teams-capture — the SAME module the desktop
@@ -1379,6 +1395,7 @@ export async function startCaptureBridge(
       const w = (globalThis as any) as Record<string, any>;
       try { w.__vexaGmeetCapture?.stop?.(); } catch { /* best-effort */ }
       try { w.__vexaGmeetChat?.destroy?.(); w.__vexaGmeetChat = null; } catch { /* best-effort */ }
+      try { w.__vexaTeamsChat?.destroy?.(); w.__vexaTeamsChat = null; } catch { /* best-effort */ }
       try { if (w.__vexaTeamsHealthTimer) { (globalThis as any).clearInterval(w.__vexaTeamsHealthTimer); w.__vexaTeamsHealthTimer = null; } } catch { /* */ }
       try { w.__vexaTeamsSpeakers?.destroy?.(); w.__vexaTeamsSpeakers = null; } catch { /* best-effort */ }
       // destroy() flushes a caption still mid-refinement as stable:false — the meeting's last

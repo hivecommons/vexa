@@ -96,6 +96,7 @@ import {
 import {
   createTeamsSpeakers,
   createTeamsCaptions,
+  createTeamsChat,
   sendTeamsChatMessage,
   prepareTeamsChatSend,
   awaitTeamsChatLanded,
@@ -133,6 +134,7 @@ const VexaBrowserUtils = {
   // ── teams lane (voice-level "blue-square" outline → speaker hints) ──
   createTeamsSpeakers,       // capture-bridge.ts: w.VexaBrowserUtils.createTeamsSpeakers
   createTeamsCaptions,       // capture-bridge.ts: w.VexaBrowserUtils.createTeamsCaptions (live CC → diagnostics)
+  createTeamsChat,           // capture-bridge.ts: w.VexaBrowserUtils.createTeamsChat (chat reader, keeps the panel open)
   sendTeamsChatMessage,      // capture-bridge.ts createChatSender: acts.v1 chat_send on teams (page-side fallback)
   prepareTeamsChatSend,      // capture-bridge.ts createChatSender: marks composer + send for trusted input
   awaitTeamsChatLanded,      // capture-bridge.ts createChatSender: the trusted send's landing check
@@ -185,6 +187,6 @@ console.log('  - GmeetChannelBinder / createPcmCaptureNode');
 console.log('  - createGmeetChat / sendGmeetChatMessage / openGmeetChatPanel / prepareGmeetChatSend / awaitGmeetChatLanded');
 console.log('  - createMixedAudioCapture / installRemoteAudioHook / selectTeamsMixStreams / createCsrcPoll');
 console.log('  - createJitsiSpeakers / createJitsiChat / sendJitsiChatMessage');
-console.log('  - createTeamsSpeakers / createTeamsCaptions / sendTeamsChatMessage / prepareTeamsChatSend / awaitTeamsChatLanded');
+console.log('  - createTeamsSpeakers / createTeamsCaptions / createTeamsChat / sendTeamsChatMessage / prepareTeamsChatSend / awaitTeamsChatLanded');
 console.log('  - createZoomSpeakers / createTrackNameResolver');
 console.log('  - window.performLeaveAction');
