@@ -288,6 +288,29 @@ def _is_cpu_unsafe_model_size(model_size: str) -> bool:
     return size.startswith("medium") or size.startswith("large")
 
 
+# Warm-up: one short inference at startup, before /health reports healthy. The first transcribe of
+# a fresh model pays one-off allocation and kernel set-up (measured on CPU: a few hundred ms on top
+# of a normal request), which would otherwise land on the first live caller.
+WARMUP = _env_bool("WARMUP", True)
+WARMUP_SECONDS = 1.0
+WARMUP_SAMPLE_RATE = 16000
+WARMUP_TONE_HZ = 220.0
+WARMUP_AMPLITUDE = 0.1
+
+
+def _warm_up(m: Any) -> None:
+    t = np.arange(int(WARMUP_SECONDS * WARMUP_SAMPLE_RATE), dtype=np.float32) / WARMUP_SAMPLE_RATE
+    tone = (WARMUP_AMPLITUDE * np.sin(2 * np.pi * WARMUP_TONE_HZ * t)).astype(np.float32)
+    started = time.time()
+    try:
+        segments, _ = m.transcribe(tone, beam_size=1, language="en", vad_filter=False)
+        for _ in segments:
+            pass
+        logger.info(f"Worker {WORKER_ID} warm-up inference took {time.time() - started:.2f}s")
+    except Exception as e:  # noqa: BLE001 - a failed warm-up must not stop the worker
+        logger.warning(f"Worker {WORKER_ID} warm-up inference failed (continuing): {e}")
+
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize Whisper model on startup"""
@@ -329,7 +352,12 @@ async def startup_event():
             model_kwargs["cpu_threads"] = CPU_THREADS
             logger.info(f"Worker {WORKER_ID} using {CPU_THREADS} CPU threads")
         
-        model = WhisperModel(**model_kwargs)
+        loaded = WhisperModel(**model_kwargs)
+        if WARMUP:
+            _warm_up(loaded)
+        # Published only now, so /health stays unhealthy (and the Pod unready) until the first
+        # real request would not pay the warm-up itself.
+        model = loaded
         logger.info(f"Worker {WORKER_ID} ready - Model loaded successfully")
     except Exception as e:
         logger.error(f"Failed to load model: {e}")
@@ -366,6 +394,7 @@ async def transcribe_audio(
     temperature: str = Form("0"),
     language: Optional[str] = Form(None),
     prompt: Optional[str] = Form(None),
+    hotwords: Optional[str] = Form(None),
     response_format: str = Form("verbose_json"),
     timestamp_granularities: str = Form("segment"),
     max_speech_duration_s: Optional[str] = Form(None),
@@ -531,6 +560,7 @@ async def transcribe_audio(
                         language=language,
                         task=task,
                         initial_prompt=prompt,
+                        hotwords=(hotwords or "").strip() or None,
                         temperature=t,
                         beam_size=BEAM_SIZE,
                         best_of=BEST_OF,
