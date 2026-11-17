@@ -17,6 +17,37 @@ export interface TeamsChatMessage { sender: string; text: string }
 export interface TeamsChatOptions {
   log?: (m: string) => void;
   onMessage: (msg: TeamsChatMessage) => void;
+  /** The bot's display name: lines Teams attributes to it are its own and are not emitted. */
+  selfName?: string;
+  /** Open the chat panel when no message list is mounted, and re-open it if it closes (the bot's
+   *  reader; the extension leaves the user's UI alone). */
+  keepOpen?: boolean;
+}
+
+/** How often the reader looks for the message list (and, with keepOpen, re-opens the panel). */
+export const TEAMS_CHAT_READER_POLL_MS = 2000;
+/** Least time between two panel-open clicks by the reader, so a slow mount is not toggled shut. */
+export const TEAMS_CHAT_REOPEN_MS = 10000;
+/** Characters of a message body the reader's log line shows. */
+const TEAMS_CHAT_LOG_CHARS = 40;
+/** How long a line the bot sent is recognised as its own when it shows in the list. */
+const TEAMS_RECENT_SENT_TTL_MS = 120000;
+
+const recentSent = new Map<string, number>();
+const sentKey = (t: string): string => t.replace(/\s+/g, ' ').trim();
+/** Remember a line the bot is sending, so the reader does not deliver it back as a participant's. */
+export function rememberTeamsChatSent(text: string): void {
+  const now = Date.now();
+  for (const [t, at] of recentSent) if (now - at > TEAMS_RECENT_SENT_TTL_MS) recentSent.delete(t);
+  recentSent.set(sentKey(text), now);
+}
+/** True (once) when `text` is a line the bot sent within the TTL. */
+function takeTeamsChatSent(text: string): boolean {
+  const k = sentKey(text);
+  const at = recentSent.get(k);
+  if (at === undefined) return false;
+  recentSent.delete(k);
+  return Date.now() - at <= TEAMS_RECENT_SENT_TTL_MS;
 }
 
 export interface TeamsChat {
@@ -67,6 +98,8 @@ const TEXT_SELECTORS = [
 
 export function createTeamsChat(opts: TeamsChatOptions): TeamsChat {
   const log = opts.log || (() => {});
+  const selfName = (opts.selfName || '').trim().toLowerCase();
+  let lastOpen = 0;
   const seenNodes = new WeakSet<Element>();
   const seenHashes = new Set<string>();
   const recent: TeamsChatMessage[] = [];
@@ -144,9 +177,13 @@ export function createTeamsChat(opts: TeamsChatOptions): TeamsChat {
     const hash = `${msg.sender} ${msg.text}`;
     if (seenHashes.has(hash)) return; // virtualized list re-renders the same item on scroll
     seenHashes.add(hash);
+    if (takeTeamsChatSent(msg.text) || (selfName && msg.sender.trim().toLowerCase() === selfName)) {
+      log(`chat (own line, not delivered): ${msg.text.slice(0, TEAMS_CHAT_LOG_CHARS)}`);
+      return;
+    }
     recent.push(msg);
     if (recent.length > 30) recent.shift();
-    log(`chat ${msg.sender}: ${msg.text.slice(0, 60)}`);
+    log(`chat ${msg.sender}: ${msg.text.slice(0, TEAMS_CHAT_LOG_CHARS)}`);
     try { opts.onMessage(msg); } catch { /* never break capture */ }
   };
 
@@ -170,6 +207,13 @@ export function createTeamsChat(opts: TeamsChatOptions): TeamsChat {
   const observer = new MutationObserver(() => { if (container) scanMessages(container); });
   const attach = () => {
     const found = findContainer();
+    if (!found && opts.keepOpen && Date.now() - lastOpen >= TEAMS_CHAT_REOPEN_MS && !findTeamsChatComposer()) {
+      const toggle = findTeamsChatToggle();
+      if (toggle && toggle.el.getAttribute('aria-pressed') !== 'true' && clickTeamsChatToggle(toggle.el, TEAMS_CHAT_TOGGLE_RECLICK_MS)) {
+        lastOpen = Date.now();
+        log(`chat panel ${container ? 're-opened' : 'opened'} via ${toggle.via}`);
+      }
+    }
     if (found && found !== container) {
       container = found;
       observer.disconnect();
@@ -181,7 +225,7 @@ export function createTeamsChat(opts: TeamsChatOptions): TeamsChat {
     }
   };
   attach();
-  const poll = window.setInterval(attach, 2000);
+  const poll = window.setInterval(attach, TEAMS_CHAT_READER_POLL_MS);
 
   return {
     destroy() { window.clearInterval(poll); observer.disconnect(); },
@@ -220,12 +264,18 @@ export const teamsChatToggleSelectors: string[] = [
   '[data-tid="chat-button"]',
   'button[data-inp="chat-button"]',
   '[data-tid="toggle-chat"]',
+  // Guest / anonymous (light-meetings) control bars carry no stable id: match the button's label.
+  'button[aria-label="Chat" i]',
+  'button[aria-label^="Show conversation" i]',
+  'button[aria-label^="Open chat" i]',
 ];
 
 /** The chat composer: Teams' editor, most-specific first. Only shown, editable fields count. */
 export const teamsChatComposerSelectors: string[] = [
   '[data-tid="ckeditor"][contenteditable="true"]',
   '[data-tid="ckeditor-replyConversation"][contenteditable="true"]',
+  // Other editor variants (guest join, new compose box) keep the ckeditor prefix.
+  '[data-tid^="ckeditor"][contenteditable="true"]',
   'div[contenteditable="true"][role="textbox"]',
   '[contenteditable="true"][aria-label*="message" i]',
 ];
@@ -305,18 +355,61 @@ export function openTeamsChatPanel(): boolean {
   return true;
 }
 
+/** How long a send waits for the composer by default. Right after admission Teams is still
+ *  rendering the meeting shell: the control bar (and its chat toggle) can take several seconds to
+ *  mount, and the panel a moment more once opened. */
+export const TEAMS_CHAT_COMPOSER_WAIT_MS = 10000;
+/** When each toggle element was last clicked by the reader or a send, so the two never click the
+ *  same toggle within `gapMs` of each other (a second click would close the panel the first one
+ *  is opening). */
+const toggleClickedAt = new WeakMap<Element, number>();
+function clickTeamsChatToggle(el: HTMLElement, gapMs: number): boolean {
+  const now = Date.now();
+  const last = toggleClickedAt.get(el);
+  if (last !== undefined && now - last < gapMs) return false;
+  toggleClickedAt.set(el, now);
+  el.click();
+  return true;
+}
+
+/** How often the wait re-reads the DOM. */
+const TEAMS_CHAT_POLL_MS = 100;
+/** Most times one wait clicks a chat toggle (a re-rendered toggle may swallow the first click). */
+const TEAMS_CHAT_MAX_TOGGLE_CLICKS = 2;
+/** Least time between two toggle clicks, so a panel that is still mounting is not closed again. */
+const TEAMS_CHAT_TOGGLE_RECLICK_MS = 3000;
+
 const teamsSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-async function awaitTeamsComposer(waitMs: number): Promise<TeamsChatHit | null> {
-  let composer = findTeamsChatComposer();
-  if (!composer && openTeamsChatPanel()) {
-    const deadline = Date.now() + waitMs;
-    while (!composer && Date.now() < deadline) {
-      await teamsSleep(100);
-      composer = findTeamsChatComposer();
+/** Wait (bounded by `waitMs`) for a visible, editable composer. The panel is opened when a toggle
+ *  shows up, even one that mounts late (the control bar right after admission); a pressed toggle is
+ *  never clicked; a toggle is clicked again only once, after TEAMS_CHAT_TOGGLE_RECLICK_MS, when the
+ *  first click did not bring the composer (the bar re-rendered under it). */
+async function awaitTeamsComposer(waitMs: number, log: (m: string) => void = () => {}): Promise<TeamsChatHit | null> {
+  const start = Date.now();
+  const deadline = start + waitMs;
+  let clicks = 0;
+  let lastClick = 0;
+  for (;;) {
+    const composer = findTeamsChatComposer();
+    if (composer) {
+      if (clicks || Date.now() - start >= TEAMS_CHAT_POLL_MS) log(`chat send: composer ready after ${Date.now() - start} ms (${clicks} toggle click(s))`);
+      return composer;
     }
+    const toggle = findTeamsChatToggle();
+    const now = Date.now();
+    if (toggle && toggle.el.getAttribute('aria-pressed') !== 'true' && clicks < TEAMS_CHAT_MAX_TOGGLE_CLICKS
+      && (clicks === 0 || now - lastClick >= TEAMS_CHAT_TOGGLE_RECLICK_MS)
+      && clickTeamsChatToggle(toggle.el, TEAMS_CHAT_TOGGLE_RECLICK_MS)) {
+      clicks += 1;
+      lastClick = now;
+    }
+    if (now >= deadline) {
+      log(`chat send: no composer after ${now - start} ms (toggle ${toggle ? `via ${toggle.via}` : 'absent'}, ${clicks} click(s))`);
+      return null;
+    }
+    await teamsSleep(Math.min(TEAMS_CHAT_POLL_MS, Math.max(1, deadline - now)));
   }
-  return composer;
 }
 
 /** The texts of the message bodies in the chat list (the matched list, else the whole page). */
@@ -362,11 +455,12 @@ export async function prepareTeamsChatSend(
     m.removeAttribute(TEAMS_CHAT_COMPOSER_MARK);
     m.removeAttribute(TEAMS_CHAT_SEND_MARK);
   }
-  const composer = await awaitTeamsComposer(opts.waitMs ?? 3000);
+  const composer = await awaitTeamsComposer(opts.waitMs ?? TEAMS_CHAT_COMPOSER_WAIT_MS, log);
   if (!composer) { log('chat send: no visible Teams chat composer (panel would not open)'); return { composer: null, send: null, before: 0 }; }
   composer.el.setAttribute(TEAMS_CHAT_COMPOSER_MARK, '1');
   const send = findTeamsChatSendButton(composer.el);
   if (send) send.el.setAttribute(TEAMS_CHAT_SEND_MARK, '1');
+  rememberTeamsChatSent(text);
   const before = countTeamsChatLines(text);
   log(`chat send: composer via ${composer.via}, send button via ${send?.via ?? 'none (Enter)'}`);
   return { composer: composer.via, send: send?.via ?? null, before };
@@ -398,9 +492,10 @@ export async function sendTeamsChatMessage(
 ): Promise<TeamsChatSendResult> {
   const log = opts.log || (() => {});
   if (!normalizeLine(text)) return { ok: false, reason: 'empty_text' };
-  const composer = await awaitTeamsComposer(opts.waitMs ?? 3000);
+  const composer = await awaitTeamsComposer(opts.waitMs ?? TEAMS_CHAT_COMPOSER_WAIT_MS, log);
   if (!composer) { log('chat send: no visible Teams chat composer'); return { ok: false, reason: 'no_composer' }; }
   const before = countTeamsChatLines(text);
+  rememberTeamsChatSent(text);
   insertTeamsText(composer.el, text);
   const send = findTeamsChatSendButton(composer.el);
   let how: string;

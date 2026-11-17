@@ -1233,6 +1233,22 @@ export async function startCaptureBridge(
         w.logBot?.('[Csrc] not in the browser bundle — continuing without transport observation');
       }
 
+      if (isTeams && w.VexaBrowserUtils?.createTeamsChat && !w.__vexaTeamsChat) {
+        // Teams chat reader: opens the meeting chat panel (and re-opens it if it closes), observes
+        // the message list, and sends each participant line across as a chat event. The bot's own
+        // lines (its display name, or a line it just sent) are not delivered back.
+        try {
+          w.__vexaTeamsChat = w.VexaBrowserUtils.createTeamsChat({
+            selfName: botName,
+            keepOpen: true,
+            log: (m: string) => w.logBot?.('[TeamsChat] ' + m),
+            onMessage: (m: { sender: string; text: string }) => w.__vexaChatMessage?.(m.sender, m.text),
+          });
+        } catch (e: any) {
+          w.__vexaTeamsChat = null;
+          w.logBot?.('[TeamsChat] init failed — continuing without the chat reader: ' + String(e));
+        }
+      }
       if (isTeams) {
         // Teams contributes the WHO signal the mixed audio can't carry: the voice-level
         // "blue-square" outline watcher (@vexa/teams-capture — the SAME module the desktop
@@ -1379,6 +1395,7 @@ export async function startCaptureBridge(
       const w = (globalThis as any) as Record<string, any>;
       try { w.__vexaGmeetCapture?.stop?.(); } catch { /* best-effort */ }
       try { w.__vexaGmeetChat?.destroy?.(); w.__vexaGmeetChat = null; } catch { /* best-effort */ }
+      try { w.__vexaTeamsChat?.destroy?.(); w.__vexaTeamsChat = null; } catch { /* best-effort */ }
       try { if (w.__vexaTeamsHealthTimer) { (globalThis as any).clearInterval(w.__vexaTeamsHealthTimer); w.__vexaTeamsHealthTimer = null; } } catch { /* */ }
       try { w.__vexaTeamsSpeakers?.destroy?.(); w.__vexaTeamsSpeakers = null; } catch { /* best-effort */ }
       // destroy() flushes a caption still mid-refinement as stable:false — the meeting's last
@@ -1600,50 +1617,75 @@ const TRUSTED_CHAT_HELPERS: Record<string, TrustedChatHelpers> = {
   teams: { prepare: 'prepareTeamsChatSend', landed: 'awaitTeamsChatLanded' },
 };
 
-/** The trusted send (google_meet, teams): page-side lookup + marks, then Playwright input on the
- *  marks, then the landing check. Resolves the outcome, or null when the trusted path could not put
- *  the line out (the caller falls back to the page-side sender). */
-async function sendChatTrusted(page: Page, text: string, landWaitMs: number, helpers: TrustedChatHelpers): Promise<ChatSendResult | null> {
-  if (typeof (page as { locator?: unknown }).locator !== 'function') return null;
-  let found: { composer: string | null; send: string | null; before: number } | null = null;
-  const landed = () => page.evaluate(async ({ text, before, waitMs, fn }) => {
-    const u = (globalThis as any).VexaBrowserUtils;
-    return u?.[fn] ? !!(await u[fn](text, before, waitMs)) : false;
-  }, { text, before: found?.before ?? 0, waitMs: landWaitMs, fn: helpers.landed });
-  try {
-    found = await page.evaluate(async ({ text, fn }) => {
-      const u = (globalThis as any).VexaBrowserUtils;
-      if (!u?.[fn]) return null;
-      const log = (m: string) => (globalThis as any).logBot?.('[ChatSend] ' + m);
-      return await u[fn](text, { log }) as { composer: string | null; send: string | null; before: number };
-    }, { text, fn: helpers.prepare });
-    if (!found) return null;
-    if (!found.composer) return { sent: false, reason: 'no_composer' };
-    const composer = page.locator('[data-vexa-chat-composer]').first();
-    await composer.fill(text, { timeout: 5000 });
-    const send = page.locator('[data-vexa-chat-send]').first();
-    let how: string;
-    if (found.send && await send.isEnabled({ timeout: 2000 }).catch(() => false)) {
-      await send.click({ timeout: 5000 });
-      how = `trusted fill + click (composer via ${found.composer}, send via ${found.send})`;
-    } else {
-      await composer.press('Enter', { timeout: 5000 });
-      how = `trusted fill + Enter (composer via ${found.composer}, send via ${found.send ?? 'none'})`;
-    }
-    if (await landed()) return { sent: true, via: how };
-    console.error(`[bot] chat_send: ${how} — the line did not show in the message list within ${landWaitMs} ms`);
-    return { sent: false, reason: 'not_landed' };
-  } catch (e) {
-    // A step threw. If the line is in the list anyway it went out; otherwise the page-side sender retries.
-    if (found?.composer && await landed().catch(() => false)) return { sent: true, via: 'trusted (a step threw after the line went out)' };
-    console.error(`[bot] chat_send: trusted path failed, falling back to the page-side sender: ${String(e)}`);
-    return null;
-  }
+/** How long a send waits for the platform's chat composer to show (the page-side helpers open the
+ *  panel and poll). Unset, each platform's helper uses its own default (Teams: 10 s, which outlasts
+ *  the meeting shell still rendering right after admission). Override: VEXA_CHAT_COMPOSER_WAIT_MS. */
+const CHAT_COMPOSER_WAIT_MS: number | undefined = Number(process.env.VEXA_CHAT_COMPOSER_WAIT_MS) > 0
+  ? Number(process.env.VEXA_CHAT_COMPOSER_WAIT_MS) : undefined;
+/** Trusted attempts per send: the second one runs only when the marked composer vanished between
+ *  the lookup and the input (the panel re-rendered under it). */
+const TRUSTED_CHAT_ATTEMPTS = 2;
+
+/** True when the composer the lookup marked is no longer in the page (a re-render dropped it). */
+async function composerVanished(page: Page): Promise<boolean> {
+  const loc = page.locator('[data-vexa-chat-composer]') as { count?: () => Promise<number> };
+  if (typeof loc.count !== 'function') return false;
+  return (await loc.count().catch(() => 1)) === 0;
 }
 
-export function createChatSender(page: Page, inv: Invocation, opts: { landWaitMs?: number } = {}): ChatSender {
+/** The trusted send (google_meet, teams): page-side lookup + marks, then Playwright input on the
+ *  marks, then the landing check. A composer that vanished before the line went out is looked up
+ *  once more. Resolves the outcome, or null when the trusted path could not put the line out (the
+ *  caller falls back to the page-side sender). */
+async function sendChatTrusted(page: Page, text: string, landWaitMs: number, helpers: TrustedChatHelpers, composerWaitMs: number | undefined = CHAT_COMPOSER_WAIT_MS): Promise<ChatSendResult | null> {
+  if (typeof (page as { locator?: unknown }).locator !== 'function') return null;
+  for (let attempt = 1; attempt <= TRUSTED_CHAT_ATTEMPTS; attempt++) {
+    let found: { composer: string | null; send: string | null; before: number } | null = null;
+    const landed = () => page.evaluate(async ({ text, before, waitMs, fn }) => {
+      const u = (globalThis as any).VexaBrowserUtils;
+      return u?.[fn] ? !!(await u[fn](text, before, waitMs)) : false;
+    }, { text, before: found?.before ?? 0, waitMs: landWaitMs, fn: helpers.landed });
+    try {
+      found = await page.evaluate(async ({ text, fn, waitMs }) => {
+        const u = (globalThis as any).VexaBrowserUtils;
+        if (!u?.[fn]) return null;
+        const log = (m: string) => (globalThis as any).logBot?.('[ChatSend] ' + m);
+        return await u[fn](text, { log, waitMs }) as { composer: string | null; send: string | null; before: number };
+      }, { text, fn: helpers.prepare, waitMs: composerWaitMs });
+      if (!found) return null;
+      if (!found.composer) return { sent: false, reason: 'no_composer' };
+      const composer = page.locator('[data-vexa-chat-composer]').first();
+      await composer.fill(text, { timeout: 5000 });
+      const send = page.locator('[data-vexa-chat-send]').first();
+      let how: string;
+      if (found.send && await send.isEnabled({ timeout: 2000 }).catch(() => false)) {
+        await send.click({ timeout: 5000 });
+        how = `trusted fill + click (composer via ${found.composer}, send via ${found.send})`;
+      } else {
+        await composer.press('Enter', { timeout: 5000 });
+        how = `trusted fill + Enter (composer via ${found.composer}, send via ${found.send ?? 'none'})`;
+      }
+      if (await landed()) return { sent: true, via: attempt > 1 ? `${how}, attempt ${attempt}` : how };
+      console.error(`[bot] chat_send: ${how} — the line did not show in the message list within ${landWaitMs} ms`);
+      return { sent: false, reason: 'not_landed' };
+    } catch (e) {
+      // A step threw. If the line is in the list anyway it went out.
+      if (found?.composer && await landed().catch(() => false)) return { sent: true, via: 'trusted (a step threw after the line went out)' };
+      if (found?.composer && attempt < TRUSTED_CHAT_ATTEMPTS && await composerVanished(page)) {
+        console.error(`[bot] chat_send: the composer vanished before the line went out (attempt ${attempt}/${TRUSTED_CHAT_ATTEMPTS}); looking it up again`);
+        continue;
+      }
+      console.error(`[bot] chat_send: trusted path failed, falling back to the page-side sender: ${String(e)}`);
+      return null;
+    }
+  }
+  return null;
+}
+
+export function createChatSender(page: Page, inv: Invocation, opts: { landWaitMs?: number; composerWaitMs?: number } = {}): ChatSender {
   const platform = inv.platform;
   const landWaitMs = opts.landWaitMs ?? GMEET_CHAT_LAND_WAIT_MS;
+  const composerWaitMs = opts.composerWaitMs ?? CHAT_COMPOSER_WAIT_MS;
   const report = (text: string, r: ChatSendResult): ChatSendResult => {
     if (r.sent) console.log(`[bot] chat_send: sent via ${r.via}: "${text.slice(0, 60)}"`);
     else console.error(`[bot] chat_send_failed reason=${r.reason} platform=${platform} chars=${text.length}`);
@@ -1653,25 +1695,25 @@ export function createChatSender(page: Page, inv: Invocation, opts: { landWaitMs
     async send(text: string): Promise<ChatSendResult> {
       if (platform !== 'google_meet' && platform !== 'jitsi' && platform !== 'teams') return report(text, { sent: false, reason: 'unsupported_platform' });
       const helpers = TRUSTED_CHAT_HELPERS[platform];
-      const trusted = helpers ? await sendChatTrusted(page, text, landWaitMs, helpers) : null;
+      const trusted = helpers ? await sendChatTrusted(page, text, landWaitMs, helpers, composerWaitMs) : null;
       if (trusted) return report(text, trusted);
       // Runs IN THE BROWSER; the platform's sender lives on the injected bundle.
-      const r = await page.evaluate(async ({ text, platform, landWaitMs }): Promise<ChatSendResult> => {
+      const r = await page.evaluate(async ({ text, platform, landWaitMs, composerWaitMs }): Promise<ChatSendResult> => {
         const u = (globalThis as any).VexaBrowserUtils;
         const log = (m: string) => (globalThis as any).logBot?.('[ChatSend] ' + m);
         if (platform === 'google_meet') {
           if (!u?.sendGmeetChatMessage) return { sent: false, reason: 'no_chat_api' };
-          const res = await u.sendGmeetChatMessage(text, { log, landWaitMs });
+          const res = await u.sendGmeetChatMessage(text, { log, landWaitMs, waitMs: composerWaitMs });
           return res.ok ? { sent: true, via: `page-side ${res.send} (composer via ${res.composer})` } : { sent: false, reason: res.reason };
         }
         if (platform === 'teams') {
           if (!u?.sendTeamsChatMessage) return { sent: false, reason: 'no_chat_api' };
-          const res = await u.sendTeamsChatMessage(text, { log, landWaitMs });
+          const res = await u.sendTeamsChatMessage(text, { log, landWaitMs, waitMs: composerWaitMs });
           return res.ok ? { sent: true, via: `page-side ${res.send} (composer via ${res.composer})` } : { sent: false, reason: res.reason };
         }
         return u?.sendJitsiChatMessage && u.sendJitsiChatMessage(text)
           ? { sent: true, via: 'jitsi conference API' } : { sent: false, reason: 'no_chat_api' };
-      }, { text, platform, landWaitMs }).catch((e): ChatSendResult => {
+      }, { text, platform, landWaitMs, composerWaitMs }).catch((e): ChatSendResult => {
         console.error(`[bot] chat_send: page-side send threw: ${String(e)}`);
         return { sent: false, reason: 'page_error' };
       });
