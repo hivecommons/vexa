@@ -23,6 +23,9 @@ env:
   BOT_FILTER: "@vexa/bot..."
   MIXED_PIPELINE_FILTER: "@vexa/mixed-pipeline"
   BOT_PACKAGE: "@vexa/bot"
+  # Browser-side capture packages the bot bundles via build-browser-utils.mjs but does not list as
+  # dependencies; the bot Dockerfile builds them first, so we do too.
+  CAPTURE_PACKAGES: "@vexa/capture-codec @vexa/gmeet-capture @vexa/mixed-capture-core @vexa/record-chunker @vexa/jitsi-capture @vexa/teams-capture @vexa/zoom-capture"
 
 jobs:
   bot:
@@ -43,6 +46,12 @@ jobs:
 
       - name: Install (frozen lockfile)
         run: pnpm install --frozen-lockfile
+
+      - name: Build browser capture packages
+        run: |
+          args=()
+          for p in $CAPTURE_PACKAGES; do args+=(--filter "$p"); done
+          pnpm "${args[@]}" run build
 
       - name: Build bot and its workspace dependencies
         run: pnpm --filter "$BOT_FILTER" run build
