@@ -1804,6 +1804,8 @@ const CHAT_COMPOSER_WAIT_MS: number | undefined = Number(process.env.VEXA_CHAT_C
 /** Trusted attempts per send: the second one runs only when the marked composer vanished between
  *  the lookup and the input (the panel re-rendered under it). */
 const TRUSTED_CHAT_ATTEMPTS = 2;
+/** How long one trusted click/keypress may wait on Playwright's actionability checks. */
+const TRUSTED_CHAT_CLICK_TIMEOUT_MS = 1000;
 
 /** True when the composer the lookup marked is no longer in the page (a re-render dropped it). */
 async function composerVanished(page: Page): Promise<boolean> {
@@ -1837,9 +1839,16 @@ async function sendChatTrusted(page: Page, text: string, landWaitMs: number, hel
       await composer.fill(text, { timeout: 5000 });
       const send = page.locator('[data-vexa-chat-send]').first();
       let how: string;
-      if (found.send && await send.isEnabled({ timeout: 2000 }).catch(() => false)) {
-        await send.click({ timeout: 5000 });
-        how = `trusted fill + click (composer via ${found.composer}, send via ${found.send})`;
+      if (found.send && await send.isEnabled({ timeout: TRUSTED_CHAT_CLICK_TIMEOUT_MS }).catch(() => false)) {
+        // A send button Playwright cannot click within a second (covered by a tooltip or overlay,
+        // or never "stable") is not waited on: Enter in the filled composer sends the same line.
+        const clicked = await send.click({ timeout: TRUSTED_CHAT_CLICK_TIMEOUT_MS }).then(() => true, () => false);
+        if (clicked) {
+          how = `trusted fill + click (composer via ${found.composer}, send via ${found.send})`;
+        } else {
+          await composer.press('Enter', { timeout: TRUSTED_CHAT_CLICK_TIMEOUT_MS });
+          how = `trusted fill + Enter after the send click timed out (composer via ${found.composer})`;
+        }
       } else {
         await composer.press('Enter', { timeout: 5000 });
         how = `trusted fill + Enter (composer via ${found.composer}, send via ${found.send ?? 'none'})`;
@@ -1870,14 +1879,8 @@ export function createChatSender(page: Page, inv: Invocation, opts: { landWaitMs
     else console.error(`[bot] chat_send_failed reason=${r.reason} platform=${platform} chars=${text.length}`);
     return r;
   };
-  return {
-    async send(text: string): Promise<ChatSendResult> {
-      if (platform !== 'google_meet' && platform !== 'jitsi' && platform !== 'teams') return report(text, { sent: false, reason: 'unsupported_platform' });
-      const helpers = TRUSTED_CHAT_HELPERS[platform];
-      const trusted = helpers ? await sendChatTrusted(page, text, landWaitMs, helpers, composerWaitMs) : null;
-      if (trusted) return report(text, trusted);
-      // Runs IN THE BROWSER; the platform's sender lives on the injected bundle.
-      const r = await page.evaluate(async ({ text, platform, landWaitMs, composerWaitMs }): Promise<ChatSendResult> => {
+  // Runs IN THE BROWSER; the platform's sender lives on the injected bundle.
+  const sendPageSide = (text: string): Promise<ChatSendResult> => page.evaluate(async ({ text, platform, landWaitMs, composerWaitMs }): Promise<ChatSendResult> => {
         const u = (globalThis as any).VexaBrowserUtils;
         const log = (m: string) => (globalThis as any).logBot?.('[ChatSend] ' + m);
         if (platform === 'google_meet') {
@@ -1896,6 +1899,28 @@ export function createChatSender(page: Page, inv: Invocation, opts: { landWaitMs
         console.error(`[bot] chat_send: page-side send threw: ${String(e)}`);
         return { sent: false, reason: 'page_error' };
       });
+  let pageSideFirst = false;
+  return {
+    async send(text: string): Promise<ChatSendResult> {
+      if (platform !== 'google_meet' && platform !== 'jitsi' && platform !== 'teams') return report(text, { sent: false, reason: 'unsupported_platform' });
+      const helpers = TRUSTED_CHAT_HELPERS[platform];
+      // Once the trusted path has failed and the page-side sender has posted in this meeting, the
+      // page-side sender goes first: the meeting UI that defeated the trusted path is still there,
+      // and paying its timeouts again on every line is pure latency. Trusted stays the fallback.
+      let first: ChatSendResult | null = null;
+      if (pageSideFirst) {
+        first = await sendPageSide(text);
+        if (first.sent) return report(text, first);
+        console.error(`[bot] chat_send: page-side sender failed (${first.reason}); trying the trusted path`);
+      }
+      const trusted = helpers ? await sendChatTrusted(page, text, landWaitMs, helpers, composerWaitMs) : null;
+      if (trusted) return report(text, trusted);
+      if (first) return report(text, first);
+      const r = await sendPageSide(text);
+      if (r.sent && helpers) {
+        pageSideFirst = true;
+        console.log('[bot] chat_send: the page-side sender goes first for the rest of this meeting');
+      }
       return report(text, r);
     },
   };

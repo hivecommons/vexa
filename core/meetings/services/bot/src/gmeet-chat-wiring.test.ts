@@ -229,6 +229,57 @@ check('WRITE: an unlanded send logs chat_send_failed with its reason and never "
   mutate(); tick();
 }
 
+// 2e. A send button Playwright cannot click in time: Enter in the filled composer sends the line.
+{
+  const ops: string[] = [];
+  const coveredPage = {
+    ...(page as object),
+    locator(sel: string) {
+      const target = () => root.querySelector(sel);
+      const handle = {
+        async fill(t: string) { ops.push(`fill ${sel}`); const el = target(); if (!el) throw new Error(`no ${sel}`); el.value = t; },
+        async isEnabled() { return !!target(); },
+        async click() { ops.push(`click ${sel}`); throw new Error('locator.click: Timeout 1000ms exceeded'); },
+        async press(k: string) { ops.push(`press ${k}`); root.querySelector('[data-vexa-chat-send]')?.click(); },
+      };
+      return { first: () => handle };
+    },
+  } as never;
+  const r = await createChatSender(coveredPage, inv('google_meet')).send('sent with Enter');
+  check('WRITE (trusted): a send click that times out falls back to Enter, still trusted',
+    r.sent && r.via.includes('Enter after the send click timed out')
+      && JSON.stringify(ops) === JSON.stringify(['fill [data-vexa-chat-composer]', 'click [data-vexa-chat-send]', 'press Enter']),
+    `r=${JSON.stringify(r)} ops=${JSON.stringify(ops)}`);
+  mutate(); tick();
+}
+
+// 2f. Trusted failed once and page-side posted: the page-side sender goes first for the rest of
+// the meeting, so later lines never pay the trusted path's timeouts again.
+{
+  const ops: string[] = [];
+  const brokenPage = {
+    ...(page as object),
+    locator(sel: string) {
+      const handle = {
+        async fill() { ops.push(`fill ${sel}`); throw new Error('locator.fill: Timeout 5000ms exceeded'); },
+        async isEnabled() { return true; },
+        async click() { ops.push(`click ${sel}`); },
+        async press(k: string) { ops.push(`press ${k}`); },
+      };
+      return { first: () => handle, count: async () => 1 };
+    },
+  } as never;
+  const s = createChatSender(brokenPage, inv('google_meet'));
+  const first = await s.send('first line');
+  mutate(); tick();
+  const opsAfterFirst = ops.length;
+  const second = await s.send('second line');
+  mutate(); tick();
+  check('WRITE: a trusted failure falls back to the page-side sender', first.sent && first.via.startsWith('page-side'), JSON.stringify(first));
+  check('WRITE: after that, the page-side sender goes first (no trusted attempt)',
+    second.sent && second.via.startsWith('page-side') && ops.length === opsAfterFirst, `second=${JSON.stringify(second)} ops=${JSON.stringify(ops)}`);
+}
+
 // 3. jitsi + unsupported platforms
 const jitsiSent: string[] = [];
 g.APP = { conference: { _room: { sendTextMessage: (t: string) => jitsiSent.push(t) } } };
