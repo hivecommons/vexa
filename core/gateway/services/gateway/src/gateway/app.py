@@ -877,6 +877,13 @@ def create_app(
     async def stop_speaking(platform: MeetingPlatform, native_meeting_id: str, request: Request):
         return await _forward_meeting(request)
 
+    # One spoken line's status by the `request_id` POST …/speak answered (queued · speaking · spoken
+    # with duration_ms · failed with reason). Thin passthrough: the line record lives in meeting-api.
+    @app.get("/bots/{platform}/{native_meeting_id}/speak/{request_id}")
+    async def read_speak_status(platform: MeetingPlatform, native_meeting_id: str, request_id: str,
+                                request: Request):
+        return await _forward_meeting(request)
+
     # P0 (cross-tenant leak fix): the by-ROW-id transcript read the terminal uses to fetch EXACTLY the
     # row it displays (owner-scoped downstream). Registered BEFORE the native route so `by-id` is not
     # matched as a {platform}. Forwarded verbatim; the auth/identity prep (X-User-Id) is shared.

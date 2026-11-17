@@ -21,7 +21,9 @@ conformance.
   a MeetingToken for the meeting it writes for (`auth` + `sig`, transcript.v1 `StreamEntry`); anything
   else is acknowledged and dropped. A `chat_send_result` entry settles the chat send it names
   (`../chat_delivery.py`), only while that send is still `queued` and only for the meeting the entry's
-  token names. No background loop — the caller drives it (eval `tick`).
+  token names. A `speak_result` entry moves the spoken line it names forward (`../speak_delivery.py`:
+  `queued → speaking → spoken | failed`), likewise only for the meeting the entry's token names. No
+  background loop — the caller drives it (eval `tick`).
 - **`segment_entry.py`** — transcript.v1's signer, vendored byte for byte from the contract (fact
   `segment-entry-signer`); the package's front door exports it as `signed_entry` for the tools that publish to the stream.
 - **`erased_feed_sweep.py`** — the one-time operator sweep

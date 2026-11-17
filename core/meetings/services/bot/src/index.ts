@@ -410,6 +410,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
       speak: createSpeakController(session.page, inv),
       chat: createChatSender(session.page, inv),
       report: (r) => liveTranscript.chatSendResult(r),
+      speakReport: (r) => liveTranscript.speakResult(r),
     });
     acts = teeActs(liveActs, { 'in-meeting': inMeeting, 'transcription-language': languageActs });
   } catch (e) {

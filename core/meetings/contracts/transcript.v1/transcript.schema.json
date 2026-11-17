@@ -87,6 +87,24 @@
         "reason": { "enum": ["unsupported_platform", "no_composer", "not_landed", "no_chat_api", "page_error", "empty_text"] }
       }
     },
+    "SpeakResult": {
+      "description": "A bus message (bot -> collector): one report for an acts.v1 `speak` that carried an `id`. `speaking` once the meeting mic is confirmed open and playback starts; `spoken` when playback ends, with `duration_ms`, the milliseconds of audio played; `failed` with the bot's SpeakFailure `reason` (`mic_muted`: the mic could not be confirmed open, so nothing was played). The collector applies it only to a line recorded for that `id` and the meeting the entry's token names, and only forward (queued -> speaking -> spoken | failed).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "meeting_id", "id", "status"],
+      "properties": {
+        "type": { "const": "speak_result" },
+        "meeting_id": { "type": ["integer", "string"] },
+        "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
+        "status": { "enum": ["speaking", "spoken", "failed"] },
+        "duration_ms": { "type": "integer", "minimum": 0 },
+        "reason": { "enum": ["voice_disabled", "mic_muted", "tts_failed", "stopped"] }
+      },
+      "allOf": [
+        { "if": { "properties": { "status": { "const": "spoken" } } }, "then": { "required": ["duration_ms"] } },
+        { "if": { "properties": { "status": { "const": "failed" } } }, "then": { "required": ["reason"] } }
+      ]
+    },
     "MutableBundle": {
       "description": "The live confirmed+pending bundle the gateway forwards verbatim to the dashboard.",
       "type": "object",

@@ -170,6 +170,15 @@
     },
     {
       "method": "GET",
+      "path": "/bots/{platform}/{native_meeting_id}/speak/{request_id}",
+      "scopes": [
+        "bot",
+        "tx"
+      ],
+      "shared": "refuse"
+    },
+    {
+      "method": "GET",
       "path": "/voice-notes/{native_meeting_id}/stream",
       "scopes": [
         "bot",
