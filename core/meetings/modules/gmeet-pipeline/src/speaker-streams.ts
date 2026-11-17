@@ -33,6 +33,9 @@ interface PendingRequest {
   baseAbs: number;
   sentAtMs: number;
   audioSec: number;
+  /** Stretch-absolute sample its window ended at: an answer covers the whole stretch only when this
+   *  is the stretch's end. */
+  endAbs: number;
   /** A newer request was accepted or a final went out: this answer, when it comes, is not used. */
   superseded: boolean;
   /** Sent again beside a stalled request. A stream has at most one of these owed at a time. */
@@ -110,6 +113,11 @@ interface SpeakerBuffer {
   quietSinceMs?: number;
   /** Speech has arrived since the last pause-final. */
   voicedSinceFinal?: boolean;
+  /** Stretch-absolute window end of the request whose answer was settled last (see settleRequest). */
+  lastAnsweredEndAbs?: number;
+  /** The lane closed this stretch itself (end of utterance, idle) while a request was in flight: an
+   *  answer whose window covers the whole stretch is used as its final instead of sending it again. */
+  finalFromCoveringAnswer?: boolean;
   /** The most recent window sent to STT carried speech-level audio (short answers are then real). */
   lastSubmitVoiced?: boolean;
   /** Wall-clock time (ms) when the current unconfirmed window started */
@@ -213,9 +221,9 @@ export interface SpeakerStreamManagerConfig {
    *  transcribed (ms). Past it the later text publishes and the earlier fills in when it lands.
    *  Default 120000. */
   orderHoldMs?: number;
-  /** End-of-utterance final: once a speaker's frames have been quiet (below silenceRmsThreshold) for
-   *  this long after speech, the window so far is sent once as a FINAL and the buffer continues
-   *  from empty — a continuous stream (a voice note's microphone) never waits for agreement or the
+  /** End-of-utterance final: once a speaker has been quiet for this long after speech (frames below
+   *  their speech bar, or no frames at all because the capture dropped silent chunks), the window so
+   *  far is sent once as a FINAL and the buffer continues from empty — a continuous stream (a voice note's microphone) never waits for agreement or the
    *  hard cap to publish. 0 disables. Default 0. */
   pauseFinalMs?: number;
   /** Pipelined drafts: send the current window every submitInterval even while earlier requests
@@ -293,11 +301,20 @@ export function cleanRepeats(text: string, previous: string): string {
   return out.join(' ');
 }
 
+/** Tick of the end-of-utterance check (ms), independent of the submission interval. */
+const EOU_TICK_MS = 100;
+/** A frame is speech when it reaches this many times the speaker's noise floor... */
+const SPEECH_BAR_FLOOR_FACTOR = 4;
+/** ...but never needs more than this RMS (a steady loud voice is not room noise). */
+const SPEECH_BAR_CAP_RMS = 0.02;
+
 export class SpeakerStreamManager {
   /** Detached stretches one speaker may have finishing at once; past it the live window extends. */
   static readonly MAX_DETACHED_PER_SPEAKER = 4;
   private buffers: Map<string, SpeakerBuffer> = new Map();
   private timers: Map<string, ReturnType<typeof setInterval>> = new Map();
+  /** Per speaker: the end-of-utterance check, on a faster tick than submissions (pauseFinalMs > 0). */
+  private eouTimers: Map<string, ReturnType<typeof setInterval>> = new Map();
   private minAudioDuration: number;
   private submitInterval: number;
   private confirmThreshold: number;
@@ -440,11 +457,24 @@ export class SpeakerStreamManager {
   /** True when the speaker's turn owes nothing more: no request in flight, no deferred final, no
    *  unconfirmed audio, and no detached stretch of it still finishing. A closed turn is removed only
    *  once settled, so a slow STT answer always finds its buffer. */
+  /** How long the speaker's live stream has been quiet (ms): no frames, or only frames under their
+   *  speech bar (tracked when pauseFinalMs > 0). Infinity for a speaker the manager does not have. */
+  quietForMs(speakerId: string): number {
+    const buffer = this.buffers.get(speakerId);
+    if (!buffer) return Infinity;
+    const now = Date.now();
+    // No frames at all is silence (captures gate silent chunks); quiet frames count from the first.
+    const noFrames = now - buffer.lastAudioTimestamp;
+    return buffer.quietSinceMs !== undefined ? Math.max(noFrames, now - buffer.quietSinceMs) : noFrames;
+  }
+
   isSettled(speakerId: string): boolean {
     for (const b of this.routes.values()) {
       if (b.speakerId !== speakerId) continue;
       if (b.retired) return false;
-      if (b.inFlight || b.pendingFinal || this.unconfirmedSamples(b) > 0) return false;
+      if (b.inFlight || b.pendingFinal) return false;
+      // Only quiet audio since the last end of utterance (an open mic, room noise) owes no transcript.
+      if (this.unconfirmedSamples(b) > 0 && !(this.pauseFinalMs > 0 && !b.voicedSinceFinal)) return false;
     }
     return true;
   }
@@ -494,6 +524,14 @@ export class SpeakerStreamManager {
 
     const timer = setInterval(() => this.trySubmit(speakerId), this.submitInterval * 1000);
     this.timers.set(speakerId, timer);
+    // The submission tick (submitInterval, ~1 s) would add up to a second to every turn end. The
+    // end-of-utterance check alone runs on its own short tick, so a pause or a mute closes the turn
+    // within pauseFinalMs + EOU_TICK_MS.
+    if (this.pauseFinalMs > 0 && EOU_TICK_MS < this.submitInterval * 1000) {
+      const eou = setInterval(() => { const b = this.buffers.get(speakerId); if (b) this.endOfUtterance(b); }, EOU_TICK_MS);
+      (eou as { unref?: () => void }).unref?.();
+      this.eouTimers.set(speakerId, eou);
+    }
 
     log(`[SpeakerStreams] Added speaker "${speakerName}" (${speakerId})`);
   }
@@ -596,7 +634,10 @@ export class SpeakerStreamManager {
     buffer.lastAudioTimestamp = Date.now();
     buffer.idleSubmitted = false;
     if (this.pauseFinalMs > 0) {
-      if (rms(audioData) >= this.silenceRmsThreshold) { buffer.quietSinceMs = undefined; buffer.voicedSinceFinal = true; }
+      // Quiet means below the speaker's speech bar (the speech gate's: 4x their noise floor, at least
+      // silenceRmsThreshold), not merely below the fixed threshold: steady room noise (a fan, a hum)
+      // is louder than 0.0025 RMS and used to hold a turn open for as long as it lasted.
+      if (level >= this.speechBar(speakerId)) { buffer.quietSinceMs = undefined; buffer.voicedSinceFinal = true; }
       else if (buffer.quietSinceMs === undefined) buffer.quietSinceMs = atMs ?? Date.now();
     }
   }
@@ -636,6 +677,15 @@ export class SpeakerStreamManager {
     // Segmentation closed this buffer while this request was in flight: the
     // text covers the pre-trim window (may include the next segment's audio).
     // Discard it and submit the owned audio as the final window.
+    // A close deferred to this answer, when the request's window ended exactly at the end of the
+    // stretch (nothing was fed or trimmed since), already IS the final window's transcription:
+    // use it as the final instead of sending the same audio again (a whole STT round trip at turn end).
+    if (buffer.pendingFinal && buffer.finalFromCoveringAnswer && buffer.capCutSample === undefined && !buffer.inFlight && this.unconfirmedSamples(buffer) > 0
+        && buffer.lastAnsweredEndAbs === buffer.absBase + buffer.totalSamples && transcript.trim().length > 0) {
+      buffer.pendingFinal = false;
+      buffer.idleSubmitted = true;
+      log(`[SpeakerStreams] Final from the answer in flight for "${buffer.speakerName}" (its window covered the whole stretch)`);
+    }
     if (buffer.pendingFinal) {
       buffer.pendingFinal = false;
       buffer.capCutSample = undefined;
@@ -788,6 +838,9 @@ export class SpeakerStreamManager {
     const timer = this.timers.get(speakerId);
     if (timer) clearInterval(timer);
     this.timers.delete(speakerId);
+    const eou = this.eouTimers.get(speakerId);
+    if (eou) clearInterval(eou);
+    this.eouTimers.delete(speakerId);
 
     const buffer = this.buffers.get(speakerId);
     if (buffer) {
@@ -795,6 +848,8 @@ export class SpeakerStreamManager {
       if (held > 0 && buffer.lastTranscript) {
         this.emitSegment(buffer, buffer.lastTranscript);
         this.account(buffer, 'transcribed', held);
+      } else if (held > 0 && this.pauseFinalMs > 0 && !buffer.voicedSinceFinal && !buffer.inFlight && !buffer.pendingFinal) {
+        this.account(buffer, 'no-speech', held);         // only quiet audio since its last utterance
       } else if (held > 0) {
         this.account(buffer, 'dropped', held, buffer.inFlight ? 'removed while its request was still in flight'
           : 'removed with untranscribed audio');
@@ -1205,6 +1260,7 @@ export class SpeakerStreamManager {
       return submitGen !== undefined && submitGen < buffer.generation ? 'stale' : 'ok';
     }
     buffer.outstanding.delete(req.seq);
+    buffer.lastAnsweredEndAbs = req.endAbs;
     const stale = req.superseded || req.generation < buffer.generation || req.seq < buffer.lastAcceptedSeq
       || req.baseAbs !== buffer.absBase + buffer.confirmedSamples;
     if (!stale && answered) {
@@ -1252,13 +1308,18 @@ export class SpeakerStreamManager {
     }
   }
 
+  /** The level a frame must reach to count as speech for this speaker: 4x their noise floor, at least
+   *  silenceRmsThreshold. The bar never rises above 0.02 RMS: anything that loud is speech, so a long
+   *  steady voice or tone (no dips for the floor to follow) is never mistaken for room noise. */
+  private speechBar(speakerId: string): number {
+    const floor = this.noiseFloor.get(speakerId) ?? 0;
+    return Math.max(this.silenceRmsThreshold, Math.min(SPEECH_BAR_FLOOR_FACTOR * floor, SPEECH_BAR_CAP_RMS));
+  }
+
   /** Does this window hold at least speechGateSec of audio clearly above the speaker's noise floor? */
   private hasSpeech(speakerId: string, pcm: Float32Array): boolean {
     if (this.speechGateSec <= 0) return true;
-    const floor = this.noiseFloor.get(speakerId) ?? 0;
-    // The bar never rises above 0.02 RMS: anything that loud is sent, so a long steady voice or tone
-    // (no dips for the floor to follow) is never mistaken for room noise.
-    const bar = Math.max(this.silenceRmsThreshold, Math.min(4 * floor, 0.02));
+    const bar = this.speechBar(speakerId);
     const step = 512;
     let voiced = 0;
     for (let i = 0; i + step <= pcm.length; i += step) if (rms(pcm.subarray(i, i + step)) >= bar) voiced += step;
@@ -1269,22 +1330,35 @@ export class SpeakerStreamManager {
     return buffer.totalSamples - buffer.confirmedSamples;
   }
 
+  /** End of utterance: after speech, the speaker has been quiet for pauseFinalMs. Quiet is either
+   *  frames below the speech bar, or NO frames at all: every capture gates silent chunks before they
+   *  reach the lane (gmeet: peak <= 0.005), so a speaker who stops talking or mutes simply stops
+   *  feeding, and a check that waited for quiet FRAMES never fired — the turn then hung on the idle
+   *  timeout behind requests in flight. Sends what was said once, as a final; returns true when it
+   *  closed the utterance. A callback-stamped feeder (Zoom per-track) loses callbacks mid-speech on a
+   *  starved page, so for it only quiet frames count. */
+  private endOfUtterance(buffer: SpeakerBuffer): boolean {
+    if (this.pauseFinalMs <= 0 || !buffer.voicedSinceFinal || buffer.idleSubmitted || buffer.retired) return false;
+    // The stretch as a whole must be long enough to be worth a final (finalSubmit's own rule); the
+    // short tail left after a confirmed draft is real speech and closes the turn like any other.
+    if (this.unconfirmedSamples(buffer) <= 0 || buffer.absBase + buffer.totalSamples < this.minFinalAudioSec * this.sampleRate) return false;
+    const quietFrames = buffer.quietSinceMs !== undefined
+      && (buffer.lastFedEndMs ?? Date.now()) - buffer.quietSinceMs >= this.pauseFinalMs;
+    const noFrames = !this.callbackStampedFrames && Date.now() - buffer.lastAudioTimestamp >= this.pauseFinalMs;
+    if (!quietFrames && !noFrames) return false;
+    const detachedNow = [...this.routes.values()].filter((b) => b.retired && b.speakerId === buffer.speakerId).length;
+    if (detachedNow >= SpeakerStreamManager.MAX_DETACHED_PER_SPEAKER) return false;
+    buffer.voicedSinceFinal = false;
+    const detached = this.detach(buffer);
+    if (detached.inFlight) { detached.pendingFinal = true; detached.finalFromCoveringAnswer = true; }
+    else void this.finalSubmit(detached, noFrames && !quietFrames ? 'end of utterance (no audio)' : 'end of utterance');
+    return true;
+  }
+
   private async trySubmit(speakerId: string): Promise<void> {
     const buffer = this.buffers.get(speakerId);
     if (!buffer) return;
-    // End of utterance: quiet for pauseFinalMs after speech → send what was said once, as a final.
-    if (this.pauseFinalMs > 0 && buffer.voicedSinceFinal && buffer.quietSinceMs !== undefined && !buffer.idleSubmitted
-        && (buffer.lastFedEndMs ?? Date.now()) - buffer.quietSinceMs >= this.pauseFinalMs
-        && this.unconfirmedSamples(buffer) >= this.minFinalAudioSec * this.sampleRate) {
-      const detachedNow = [...this.routes.values()].filter((b) => b.retired && b.speakerId === speakerId).length;
-      if (detachedNow < SpeakerStreamManager.MAX_DETACHED_PER_SPEAKER) {
-        buffer.voicedSinceFinal = false;
-        const detached = this.detach(buffer);
-        if (detached.inFlight) detached.pendingFinal = true;
-        else void this.finalSubmit(detached, 'end of utterance');
-        return;
-      }
-    }
+    if (this.endOfUtterance(buffer)) return;
     // Behind: the audio waiting has outgrown one request's window (a request is in flight, or a long
     // one just answered). Split the oldest window off and send it on its own, so no request carries
     // more than maxBufferDuration and several windows are transcribed at once.
@@ -1302,6 +1376,17 @@ export class SpeakerStreamManager {
       this.splitFront(buffer, cut);
     }
     this.finalIfOwed(buffer);
+    // Idle while a request is still in flight: the turn is over all the same. Close it now, deferred
+    // to that answer (used as the final when it covers the whole stretch), instead of waiting for
+    // every request to settle before the idle timeout is even looked at: with a slow or overloaded
+    // STT that wait was most of the "9.0s idle" a 1 s timeout produced.
+    if (buffer.inFlight && !buffer.pendingFinal && !buffer.idleSubmitted && buffer.capCutSample === undefined
+        && Date.now() - buffer.lastAudioTimestamp > this.idleTimeoutSec * 1000 && this.unconfirmedSamples(buffer) > 0) {
+      log(`[SpeakerStreams] Idle close for "${buffer.speakerName}" while a request is in flight ` +
+          `(${((Date.now() - buffer.lastAudioTimestamp) / 1000).toFixed(1)}s idle) — final deferred to its answer`);
+      buffer.pendingFinal = true;
+      buffer.finalFromCoveringAnswer = true;
+    }
     if (buffer.inFlight) {
       this.resendIfStalled(buffer);
       // Pipelined drafts: a newer window goes out beside the one in flight when audio has grown.
@@ -1432,7 +1517,7 @@ export class SpeakerStreamManager {
     const seq = ++this.requestSeq;
     buffer.outstanding.set(seq, {
       seq, generation: buffer.generation, baseAbs: buffer.absBase + buffer.confirmedSamples,
-      sentAtMs: Date.now(), audioSec: unconfirmed / this.sampleRate, superseded: false,
+      sentAtMs: Date.now(), audioSec: unconfirmed / this.sampleRate, endAbs: buffer.absBase + end, superseded: false,
       duplicate: buffer.markNextDuplicate === true,
     });
     buffer.markNextDuplicate = false;
@@ -1778,6 +1863,7 @@ export class SpeakerStreamManager {
     buffer.lastAudioTimestamp = Date.now();
     buffer.idleSubmitted = false;
     buffer.pendingFinal = false;
+    buffer.finalFromCoveringAnswer = false;
     buffer.carryForwardSamples = 0;
     buffer.lastFedEndMs = undefined;
     buffer.submittedEndSample = undefined;
