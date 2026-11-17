@@ -86,6 +86,11 @@ export interface GmeetPipelineOptions {
   /** How long a group may wait for STT back-pressure to clear before its drafts are confirmed as
    *  they are (ms). Default 15000. */
   reconfirmHoldMs?: number;
+  /** Silence (ms) after which a speaker's open group is reconfirmed without waiting the rest of
+   *  `reconfirmIdleMs` past their last draft: the speaker stopped (went quiet, or muted and no frames
+   *  arrive), so their turn is over and its confirmed segment should not wait on the draft clock.
+   *  Default 1000. */
+  reconfirmQuietMs?: number;
 }
 
 /** The lane's progress report (snake_case: it goes on the wire as is). */
@@ -120,6 +125,11 @@ export function formatCoverage(c: CoverageStats): string {
   return `[COVERAGE] captured=${c.capturedSec}s submitted=${c.submittedSec}s transcribed=${c.transcribedSec}s ` +
     `(${pct}% of captured) no_speech=${c.noSpeechSec}s short=${c.shortSec}s dropped=${c.droppedSec}s`;
 }
+
+/** Default `reconfirmQuietMs`: a second of silence ends the speaker's turn. */
+const DEFAULT_RECONFIRM_QUIET_MS = 1000;
+/** Tick of the reconfirmation sweep (ms). */
+const RECONFIRM_SWEEP_MS = 100;
 
 export function createGmeetPipeline(opts: GmeetPipelineOptions): GmeetPipeline {
   const UNKNOWN = opts.unknownLabel ?? 'Speaker';
@@ -190,6 +200,7 @@ export function createGmeetPipeline(opts: GmeetPipelineOptions): GmeetPipeline {
   const RECONFIRM_MS = Math.max(0, (opts.reconfirmSec ?? 0) * 1000);
   const RECONFIRM_IDLE = opts.reconfirmIdleMs ?? 1500;
   const RECONFIRM_HOLD = opts.reconfirmHoldMs ?? 15_000;
+  const RECONFIRM_QUIET = opts.reconfirmQuietMs ?? DEFAULT_RECONFIRM_QUIET_MS;
   type Frag = { name: string; text: string; startMs: number; endMs: number; lang?: string };
   type Group = { key: string; frags: Frag[]; lastAt: number; settled?: boolean };
   const groups = new Map<string, Group>();
@@ -261,8 +272,10 @@ export function createGmeetPipeline(opts: GmeetPipelineOptions): GmeetPipeline {
   const chanName = new Map<string, string>();
   const sweep = RECONFIRM_MS > 0 ? setInterval(() => {
     const now = Date.now();
-    for (const [key, g] of [...groups]) if (now - g.lastAt >= RECONFIRM_IDLE && mgr.isSettled(key)) closeGroup(key);
-  }, 250) : undefined;
+    for (const [key, g] of [...groups]) {
+      if ((now - g.lastAt >= RECONFIRM_IDLE || mgr.quietForMs(key) >= RECONFIRM_QUIET) && mgr.isSettled(key)) closeGroup(key);
+    }
+  }, RECONFIRM_SWEEP_MS) : undefined;
   (sweep as { unref?: () => void } | undefined)?.unref?.();
 
   mgr.onSegmentConfirmed = (speakerId, speakerName, text, startMs, endMs, _segmentId, lang) => {
