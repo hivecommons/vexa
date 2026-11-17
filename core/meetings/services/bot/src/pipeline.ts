@@ -150,6 +150,8 @@ export interface BotPipeline extends Pipeline {
   recordRosterCoverage?(named: number, participants: number, tMs?: number): void;
   /** Mixed lane only: the cumulative hint-hop counters (undefined on the gmeet lane). */
   readonly hintCounters?: HintCounters;
+  /** Teams lane: what crossed to STT (chunks, audio seconds, bytes, first-chunk time). */
+  readonly sttCounters?: SttCounters;
   /** Every stretch of captured audio the lane will never transcribe (a window the STT refused past
    *  its retries, the held-audio bound, a lane closed with audio still owed), by capture time in
    *  epoch ms. Read after stop() for the terminal lifecycle event — a loss is a recorded gap in the
@@ -325,6 +327,61 @@ function createGmeetBotPipeline(
   };
 }
 
+/** What crossed to STT, cumulatively — the last hop before the transcription service. A lane can
+ *  be fed audio for a whole meeting and still send nothing; this is the counter that says which. */
+export interface SttCounters {
+  /** Transcription requests sent. */
+  chunks: number;
+  /** Audio carried by those requests, seconds. */
+  audioSec: number;
+  /** The same audio as 16-bit PCM bytes (the wire codec compresses further). */
+  pcmBytes: number;
+  /** Epoch ms of the first request, undefined until one is sent. */
+  firstChunkAtMs?: number;
+}
+
+/** Bytes per sample of the 16-bit PCM the STT counters report in. */
+const PCM16_BYTES_PER_SAMPLE = 2;
+/** The lanes' sample rate. */
+const LANE_SAMPLE_RATE = 16_000;
+
+/** Wrap a transcribe closure so every request is counted before it leaves. */
+export function countingTranscribe<T extends (pcm: Float32Array, ...rest: any[]) => Promise<TranscriptionResult>>(
+  transcribe: T,
+  counters: SttCounters,
+  now: () => number = Date.now,
+): T {
+  return (async (pcm: Float32Array, ...rest: any[]) => {
+    counters.chunks++;
+    counters.audioSec += pcm.length / LANE_SAMPLE_RATE;
+    counters.pcmBytes += pcm.length * PCM16_BYTES_PER_SAMPLE;
+    if (counters.firstChunkAtMs === undefined) counters.firstChunkAtMs = now();
+    return transcribe(pcm, ...rest);
+  }) as T;
+}
+
+/**
+ * The Teams lane's submission timing. A CSRC lane is fed only while its source is audible, so on
+ * the shared window's own defaults (2 s minimum, 15 s idle) an utterance shorter than the minimum
+ * reaches STT only after the idle timeout — tens of seconds after it was said. Teams submits after one second of speech and finalizes an utterance
+ * within ~1.5 s of its end; confirmation (two agreeing passes) stays the shared window's default,
+ * since the lane already publishes the forming draft as soon as the first pass answers.
+ */
+export const TEAMS_MIN_AUDIO_SEC = 1;
+export const TEAMS_IDLE_TIMEOUT_SEC = 1.5;
+
+/** The Teams lane's buffer tuning: its own latency defaults, overridden by the lane tuning knobs
+ *  that mean the same thing on the CSRC window (submission minimum, cadence, idle finalization). */
+export function teamsLaneBufferConfig(
+  config?: SpeakerStreamManagerConfig,
+): NonNullable<TeamsCsrcGmeetPipelineOptions['buffer']> {
+  return {
+    minAudioDuration: config?.minAudioDuration ?? TEAMS_MIN_AUDIO_SEC,
+    idleTimeoutSec: config?.idleTimeoutSec ?? TEAMS_IDLE_TIMEOUT_SEC,
+    ...(config?.submitInterval !== undefined ? { submitInterval: config.submitInterval } : {}),
+  };
+}
+
 /** Build the Teams-only CSRC virtual-channel lane. The shared GMeet-compatible buffer owns
  * cadence, prompt feedback, LocalAgreement and terminal fallback. This adapter owns only the bot
  * ports: mixed PCM/identity evidence in, transcript.v1 publish/retract out. */
@@ -336,12 +393,22 @@ function createTeamsBotPipeline(
   onObservation?: (source: string, obs: Record<string, unknown>, tMs?: number) => void,
   selfName?: string,
   stopBudgetMs: number = STOP_TRANSCRIBE_BUDGET_MS,
+  buffer: TeamsCsrcGmeetPipelineOptions['buffer'] = teamsLaneBufferConfig(),
 ): BotPipeline {
   const hintCounters: HintCounters = { received: 0, matched: 0, missed: 0 };
+  const sttCounters: SttCounters = { chunks: 0, audioSec: 0, pcmBytes: 0 };
+  const counted = countingTranscribe(transcribe, sttCounters);
   const reportError = onError ?? ((error: unknown) => console.error(`[bot] pipeline(teams-csrc): ${String(error)}`));
 
   const transcriber = createTranscriber({
-    transcribe: (pcm, prompt) => transcribe(pcm, prompt),
+    transcribe: (pcm, prompt) => counted(pcm, prompt),
+    buffer,
+    onNoTransportFallback: (event) => {
+      console.log(event.engaged
+        ? `[bot] pipeline(teams-csrc): no CSRC edge after ${Math.round(event.waitedMs)}ms of capture — transcribing the mix on the fallback lane`
+        : `[bot] pipeline(teams-csrc): first CSRC edge — fallback lane retired after ${event.routedFrames} frame(s)`);
+      try { onObservation?.('teams-csrc-fallback', { ...event }, event.tMs); } catch { /* diagnostics never break the lane */ }
+    },
     // Give up a window inside the stop budget, so it is reported missing on the terminal event.
     finalPassMs: Math.max(0, stopBudgetMs - 5_000),
     selfName,
@@ -373,6 +440,7 @@ function createTeamsBotPipeline(
     recordRosterName: (name, tMs) => transcriber.recordRosterName(name, tMs),
     recordRosterCoverage: (named, participants, tMs) => transcriber.recordRosterCoverage(named, participants, tMs),
     hintCounters,
+    sttCounters,
     missingRanges: () => transcriber.missingRanges?.() ?? [],
   };
 }
@@ -571,6 +639,7 @@ export function createBotPipeline(
   if (inv.platform === 'teams') {
     return createTeamsBotPipeline(
       transcribe, sink, opts.onError, opts.createTeamsTranscriber, opts.onObservation, inv.botName, stopBudgetMs,
+      teamsLaneBufferConfig(opts.config),
     );
   }
   // Zoom rides the per-channel (gmeet) lane per-track; only Jitsi remains on the legacy mixed

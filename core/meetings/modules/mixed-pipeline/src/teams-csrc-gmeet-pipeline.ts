@@ -74,7 +74,45 @@ export interface TeamsCsrcGmeetPipelineOptions {
   /** After dispose begins, failed requests are retried back to back until this deadline (ms); then
    *  the window is given up and the loss is reported through onError. Default 120000. */
   finalPassMs?: number;
+  /** How much speech (ms of energetic mixed audio) may arrive with NO transport edge at all before
+   *  the lane stops waiting for CSRC and routes the mix to one fallback lane. Default
+   *  TEAMS_NO_TRANSPORT_FALLBACK_MS; Infinity disables the fallback. */
+  noTransportFallbackMs?: number;
+  /** The fallback lane engaged (no CSRC ever seen) or disengaged (the first CSRC edge arrived). */
+  onNoTransportFallback?: (event: TeamsNoTransportFallbackEvent) => void;
 }
+
+export interface TeamsNoTransportFallbackEvent {
+  engaged: boolean;
+  tMs: number;
+  /** Capture time between the first mixed frame and this event. */
+  waitedMs: number;
+  /** Frames the fallback lane routed to transcription before this event. */
+  routedFrames: number;
+}
+
+/**
+ * The virtual lane the mix rides when the transport never reports a contributing source. A real
+ * CSRC is a uint32, so -1 can never collide with one, and it still reads as a number everywhere
+ * a CSRC is expected (speaker_key `csrc:-1`, the namer's track id `-1`).
+ */
+export const TEAMS_NO_TRANSPORT_LANE = -1;
+
+/**
+ * How much SPEECH (ms of energetic mixed audio) may arrive with no CSRC edge before the lane
+ * transcribes the mix without one.
+ *
+ * CSRC routing alone would leave a meeting whose transport never names a contributing source (a
+ * client that does not mix server-side, a receiver the poll cannot read, a renamed accessor) with
+ * ZERO routed frames: audio heard, nothing sent to STT. Long enough that a working transport always
+ * speaks first (its first edge arrives within a packet train of the first word), short enough that
+ * a lane without one starts transcribing within seconds of the first speech.
+ */
+export const TEAMS_NO_TRANSPORT_FALLBACK_MS = 3000;
+
+/** Peak below which a fallback frame is silence and is not routed — the same gate the per-track
+ *  page capture applies, so the fallback lane carries speech stretches, not a continuous hiss. */
+export const TEAMS_FALLBACK_SILENCE_PEAK = 0.005;
 
 export interface TeamsCsrcGmeetPipelineHealth extends TeamsCsrcChannelizerHealth {
   turns: number;
@@ -85,6 +123,10 @@ export interface TeamsCsrcGmeetPipelineHealth extends TeamsCsrcChannelizerHealth
   rejectedOwnership: number;
   timeoutPromotions: number;
   contestedPairs: number;
+  /** True while the mix rides the no-transport fallback lane. */
+  noTransportFallback: boolean;
+  /** Frames the fallback lane routed to transcription. */
+  fallbackFrames: number;
 }
 
 export interface CsrcOwnershipInterval { startMs: number; endMs?: number }
@@ -181,6 +223,19 @@ export class TeamsCsrcGmeetPipeline {
   private readonly missing: MissingRange[] = [];
   private rejectedOwnership = 0;
   private timeoutPromotions = 0;
+  private readonly noTransportFallbackMs: number;
+  /** Capture time of the first mixed frame — the fallback's wait is measured from it. */
+  private firstAudioMs: number | undefined;
+  /** Set by the first transport edge; from then on CSRC alone routes audio. */
+  private transportSeen = false;
+  private fallbackActive = false;
+  /** Whether the fallback track is currently "speaking" for the namer (energy-driven edges). */
+  private fallbackSpeaking = false;
+  private fallbackLastEnergyMs = Number.NEGATIVE_INFINITY;
+  private fallbackFrames = 0;
+  /** Speech held while the fallback waits to arm, routed on engagement. */
+  private readonly fallbackHeld: Array<{ pcm: Float32Array; tsMs: number }> = [];
+  private fallbackHeldMs = 0;
 
   constructor(private readonly options: TeamsCsrcGmeetPipelineOptions) {
     this.onsetGapMs = Math.max(0, options.onsetGapMs ?? 1000);
@@ -188,6 +243,7 @@ export class TeamsCsrcGmeetPipeline {
     this.ownershipLookbackMs = Math.max(0, options.ownershipLookbackMs ?? 1200);
     this.ownershipSlackMs = Math.max(0, options.ownershipSlackMs ?? 600);
     this.persistTimeoutMs = Math.max(0, options.persistTimeoutMs ?? 4000);
+    this.noTransportFallbackMs = Math.max(0, options.noTransportFallbackMs ?? TEAMS_NO_TRANSPORT_FALLBACK_MS);
     this.trackNamer = new TrackNamer({
       selfName: options.selfName,
       // Teams sometimes exposes a media/topic handle — a session subject rather than the human's
@@ -330,12 +386,99 @@ export class TeamsCsrcGmeetPipeline {
   }
 
   feedMixedAudio(pcm: Float32Array, tsMs: number): void {
+    if (!this.transportSeen && Number.isFinite(tsMs)) this.feedNoTransportFallback(pcm, tsMs);
     this.channelizer.feedAudio(pcm, tsMs);
     this.trackNamer.tick(tsMs + pcm.length / 16_000 * 1000);
     this.promoteTimedOutDrafts(tsMs);
   }
 
+  /**
+   * Route the mix to one fallback lane while the transport has never reported a contributing
+   * source. Naming still works: the fallback track turns active/inactive on speech energy, so the
+   * namer can bind Teams' own speaking hints to it exactly as it binds them to a CSRC track; with
+   * no corroborated hint it keeps its stable Speaker label (published as unknown).
+   */
+  private feedNoTransportFallback(pcm: Float32Array, tsMs: number): void {
+    if (this.firstAudioMs === undefined) this.firstAudioMs = tsMs;
+    const lane = TEAMS_NO_TRANSPORT_LANE;
+    let peak = 0;
+    for (let i = 0; i < pcm.length; i++) { const a = Math.abs(pcm[i]); if (a > peak) peak = a; }
+    const frameMs = pcm.length / 16_000 * 1000;
+    const energetic = peak > TEAMS_FALLBACK_SILENCE_PEAK;
+    if (!this.fallbackActive) {
+      // Wait on SPEECH, not on wall time: a working transport reports its first edge within a
+      // packet train of the first word, so only speech that arrives with no edge arms the
+      // fallback. The waiting speech is held and routed on engagement, so no word is lost to it.
+      if (!energetic) return;
+      this.fallbackHeld.push({ pcm, tsMs });
+      this.fallbackHeldMs += frameMs;
+      if (this.fallbackHeldMs < this.noTransportFallbackMs) return;
+      this.fallbackActive = true;
+      const held = this.fallbackHeld.splice(0);
+      this.fallbackHeldMs = 0;
+      this.ownership.set(lane, [{ startMs: held[0]?.tsMs ?? tsMs }]);
+      this.notifyFallback(true, tsMs);
+      for (const frame of held) this.routeFallbackFrame(frame.pcm, frame.tsMs);
+      return;
+    }
+    if (!energetic) {
+      if (this.fallbackSpeaking && tsMs - this.fallbackLastEnergyMs > this.onsetGapMs) {
+        this.fallbackSpeaking = false;
+        this.trackNamer.setTrackActive(String(lane), false, this.fallbackLastEnergyMs);
+      }
+      return;
+    }
+    this.routeFallbackFrame(pcm, tsMs);
+  }
+
+  private routeFallbackFrame(pcm: Float32Array, tsMs: number): void {
+    const lane = TEAMS_NO_TRANSPORT_LANE;
+    if (!this.fallbackSpeaking) {
+      this.fallbackSpeaking = true;
+      this.trackNamer.setTrackActive(String(lane), true, tsMs);
+    }
+    const endMs = tsMs + pcm.length / 16_000 * 1000;
+    this.fallbackLastEnergyMs = endMs;
+    this.fallbackFrames++;
+    this.recordRoutedSpan(lane, tsMs, endMs);
+    this.routeFrame(lane, pcm, tsMs);
+  }
+
+  private notifyFallback(engaged: boolean, tMs: number): void {
+    try {
+      this.options.onNoTransportFallback?.({
+        engaged, tMs, waitedMs: Math.max(0, tMs - (this.firstAudioMs ?? tMs)), routedFrames: this.fallbackFrames,
+      });
+    } catch { /* diagnostics never break the transcript lane */ }
+  }
+
+  /** The first transport edge retires the fallback lane for good: CSRC routing owns the meeting
+   *  from here, and keeping both would feed every later word to STT twice. */
+  private retireNoTransportFallback(tMs: number): void {
+    this.transportSeen = true;
+    this.fallbackHeld.length = 0;
+    this.fallbackHeldMs = 0;
+    if (!this.fallbackActive) return;
+    this.fallbackActive = false;
+    const lane = TEAMS_NO_TRANSPORT_LANE;
+    if (this.fallbackSpeaking) {
+      this.fallbackSpeaking = false;
+      this.trackNamer.setTrackActive(String(lane), false, tMs);
+    }
+    const open = (this.ownership.get(lane) ?? []).find((interval) => interval.endMs === undefined);
+    if (open) open.endMs = tMs;
+    const state = this.tracks.get(lane);
+    if (state) {
+      this.tracks.delete(lane);
+      this.closeTurn(state.key);
+    }
+    this.notifyFallback(false, tMs);
+  }
+
   recordTransportEvent(event: TransportEvent): void {
+    if (!this.transportSeen && Number.isFinite(event.csrc) && Number.isFinite(event.tMs)) {
+      this.retireNoTransportFallback(event.tMs);
+    }
     this.trackNamer.setTrackActive(String(event.csrc), event.active, event.tMs);
     const intervals = this.ownership.get(event.csrc) ?? [];
     if (event.active) {
@@ -390,6 +533,8 @@ export class TeamsCsrcGmeetPipeline {
       rejectedOwnership: this.rejectedOwnership,
       timeoutPromotions: this.timeoutPromotions,
       contestedPairs: this.contests.size,
+      noTransportFallback: this.fallbackActive,
+      fallbackFrames: this.fallbackFrames,
     };
   }
 

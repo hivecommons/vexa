@@ -351,6 +351,8 @@ async function main(): Promise<void> {
 
     check('Teams selects the CSRC/GMeet factory, never the legacy Pyannote-capable mixed factory',
       !!options && !legacyMixedFactoryCalled);
+    check('Teams lane submits after 1 s of speech and finalizes within 1.5 s of its end (not 2 s / 15 s)',
+      options!.buffer?.minAudioDuration === 1 && options!.buffer?.idleTimeoutSec === 1.5, JSON.stringify(options!.buffer));
     check('Teams forwards mixed PCM plus CSRC, hint, caption, roster, and coverage evidence',
       ['audio:1000', 'csrc:201:true', 'hint:Alice', 'caption:Alice', 'roster:Alice', 'coverage:1/2']
         .every((entry) => calls.includes(entry)), JSON.stringify(calls));

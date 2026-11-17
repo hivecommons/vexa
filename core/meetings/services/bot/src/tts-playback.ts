@@ -25,6 +25,8 @@ import http from 'node:http';
 import type { Readable } from 'node:stream';
 
 const PAPLAY_ARGS = ['--raw', '--format=s16le', '--rate=24000', '--channels=1', '--device=tts_sink'];
+/** Bytes per millisecond of the PCM above: 24 kHz, mono, 16-bit. */
+const TTS_PCM_BYTES_PER_MS = (24_000 * 2) / 1000;
 
 /** Lines up to this many characters are cached (acknowledgements, short replies). */
 export const TTS_CACHE_MAX_CHARS = 120;
@@ -48,9 +50,10 @@ function setTtsMute(muted: boolean, log: (m: string) => void): void {
 
 export interface TtsPlayback {
   /** Synthesize `text` (voice optional) and play it into the meeting via tts_sink. Resolves when
-   *  playback finishes. Best-effort: a synthesis/playback failure logs + resolves (never throws out
-   *  — the voice handler must not break the orchestrator). */
-  speak(text: string, voice?: string): Promise<void>;
+   *  playback finishes, with the milliseconds of audio played (0 when nothing played). Best-effort:
+   *  a synthesis/playback failure logs + resolves (never throws out — the voice handler must not
+   *  break the orchestrator). */
+  speak(text: string, voice?: string): Promise<number>;
   /** Synthesize `lines` for `voice` into the cache without playing them (lines already cached or too
    *  long are skipped). Resolves when done; failures are logged, never thrown. */
   prewarm(lines: string[], voice?: string): Promise<void>;
@@ -196,24 +199,24 @@ export function createTtsPlayback(
     if (current === p) current = null;
   };
 
-  const speak = async (text: string, voice = 'auto'): Promise<void> => {
+  const speak = async (text: string, voice = 'auto'): Promise<number> => {
     const key = keyOf(voice, text);
     const hit = cacheable(text) ? recall(key) : undefined;
     if (hit) {
       log(`[tts] cached line (${hit.length} bytes)`);
       await play((input) => input.end(hit));
       warm(voice);
-      return;
+      return Math.round(hit.length / TTS_PCM_BYTES_PER_MS);
     }
     const stream = await synthesize(text, voice);
-    if (!stream) return;
+    if (!stream) return 0;
+    let bytes = 0;
     const chunks: Buffer[] | null = cacheable(text) ? [] : null;
-    if (chunks) {
-      stream.on('data', (c: Buffer) => chunks.push(Buffer.from(c)));
-      stream.on('end', () => remember(key, Buffer.concat(chunks)));
-    }
+    stream.on('data', (c: Buffer) => { bytes += c.length; if (chunks) chunks.push(Buffer.from(c)); });
+    if (chunks) stream.on('end', () => remember(key, Buffer.concat(chunks)));
     await play((input) => { stream.pipe(input); });   // stream PCM straight to the mic sink
     warm(voice);
+    return Math.round(bytes / TTS_PCM_BYTES_PER_MS);
   };
 
   // The configured lines for the default voice are synthesized as soon as the bot can speak.
