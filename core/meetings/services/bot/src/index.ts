@@ -25,7 +25,7 @@
 import { createClient } from 'redis';
 import { isMixedLanePlatform, loadInvocation, InvocationError, speakerStreamConfigFromEnv, withLatencyProfile, type Invocation } from './config.js';
 import type { Act, LifecycleEvent, TranscriptSegment } from './contracts.js';
-import { createOrchestrator } from './orchestrator.js';
+import { createOrchestrator, leaveDrainMsFromEnv } from './orchestrator.js';
 import { createHttpLifecycleSink } from './adapters/lifecycle-http.js';
 import { createRedisTranscriptSink, redisClientFrom } from './adapters/transcript-redis.js';
 import { createRedisActsSource, redisActsClientFrom } from './adapters/acts-redis.js';
@@ -209,6 +209,8 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
   let pipeline: Pipeline;
   let botPipeline: BotPipeline | null = null;
   let acts: ActsSource = liveActs;
+  let openMicAtJoin: (() => Promise<void>) | undefined;
+  let beforeLeave: (() => Promise<void>) | undefined;
   // A voice note has no page to record from (its audio arrives as frames), so it records nothing here.
   const isVoiceNote = inv.platform === 'voice_note';
   // A call (#1783) is the same: its audio arrives as the room's tracks, not from a page.
@@ -395,7 +397,12 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     // each failure surfaces LOUD via onFault (console with a full-fidelity serr(e)) instead of
     // throwing into the orchestrator's leave-on-fail backstop (which would hang the bot up).
     pipeline = createLivePipeline({
-      startCapture: () => startCaptureBridge(sess.page, inv, bp, signalRecorder?.sink, publishChat, remoteAudioActivity),   // on the live meeting page
+      startCapture: () => {
+        // The bot is in the meeting: a voice bot opens its mic now, so the first line does not pay
+        // for it (a no-op for a bot that cannot speak). Never awaited: capture does not wait on it.
+        void openMicAtJoin?.().catch((e) => console.error(`[bot] speak: opening the mic at join failed: ${String(e)}`));
+        return startCaptureBridge(sess.page, inv, bp, signalRecorder?.sink, publishChat, remoteAudioActivity);   // on the live meeting page
+      },
       startRecording: rec ? () => startRecording(sess.page, inv, rec) : undefined,          // MediaRecorder → recording.v1
       engine: bp,
       onFault: (stage, e) => {
@@ -406,12 +413,16 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     // `chat_send` reaches the ChatSender (ungated: a text act, not a voice one) and its outcome goes
     // back to meeting-api on the signed stream, and `reconfigure` reaches the transcription-language
     // control.
+    const speaker = createSpeakController(session.page, inv);
+    openMicAtJoin = () => speaker.prepare();
     const inMeeting = createActDispatch({
-      speak: createSpeakController(session.page, inv),
+      speak: speaker,
       chat: createChatSender(session.page, inv),
       report: (r) => liveTranscript.chatSendResult(r),
       speakReport: (r) => liveTranscript.speakResult(r),
     });
+    // A stop waits (bounded) for the lines and chat sends this handler still has in progress.
+    beforeLeave = async () => { await inMeeting.idle(); await speaker.idle(); };
     acts = teeActs(liveActs, { 'in-meeting': inMeeting, 'transcription-language': languageActs });
   } catch (e) {
     console.error(`[bot] browser launch/capture wiring failed — falling back to clean terminal failed: ${String(e)}`);
@@ -442,6 +453,8 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     aloneness: noBrowser ? voiceAloneness : aloneness,
     recording: recording as RecordingSink | undefined,
     reachability,
+    beforeLeave: () => beforeLeave?.() ?? Promise.resolve(),
+    leaveDrainMs: leaveDrainMsFromEnv(env),
     // The node this pod runs on (downward API), and the one picture of a failed join, so the
     // platform retry can place the next attempt elsewhere and a human can see what the bot saw.
     nodeName: process.env.VEXA_NODE_NAME || undefined,

@@ -135,5 +135,37 @@ for (const act of [{ action: 'leave' }, { action: 'chat_read' }, { action: 'scre
   check('a speak report that fails never fails the act', !threw);
 }
 
+// ── a spoken line reports where its time went; idle() waits for lines and chat sends in progress ──
+{
+  const id = '0f1e2d3c4b5a69788796a5b4c3d2e1f0';
+  const reports: unknown[] = [];
+  const order: string[] = [];
+  const timed = createActDispatch({
+    speak: {
+      async speak(text) {
+        await new Promise((r) => setTimeout(r, 40));
+        order.push(`spoken:${text}`);
+        return { spoken: true as const, durationMs: 1827, timing: { queueMs: 3.4, micMs: 6, firstAudioMs: 412.6, synthMs: 400, cached: false, totalMs: 2300 } };
+      },
+      async stop() {},
+    },
+    chat: { async send(text) { await new Promise((r) => setTimeout(r, 60)); order.push(`posted:${text}`); return { sent: true, via: 'test' }; } },
+    speakReport: async (r) => { reports.push(r); },
+  });
+  await timed({ action: 'speak', text: 'timed', id });
+  check('spoken carries queue_ms, mic_ms, first_audio_ms, synth_ms and cached (whole milliseconds)',
+    JSON.stringify(reports[0]) === JSON.stringify({ id, status: 'spoken', duration_ms: 1827, queue_ms: 3, mic_ms: 6, first_audio_ms: 413, synth_ms: 400, cached: false }),
+    JSON.stringify(reports));
+  order.length = 0;
+  void timed({ action: 'speak', text: 'Leaving now.' });
+  void timed({ action: 'chat_send', text: 'Leaving now.' });
+  await timed.idle();
+  check('idle resolves only once the line and the chat send in progress are done',
+    order.join(',') === 'spoken:Leaving now.,posted:Leaving now.', order.join(','));
+  const t0 = Date.now();
+  await timed.idle();
+  check('idle with nothing in progress resolves at once', Date.now() - t0 < 20);
+}
+
 console.log(failed ? `\n❌ ${failed} check(s) failed` : '\n✅ act-dispatch: all checks passed');
 process.exit(failed ? 1 : 0);

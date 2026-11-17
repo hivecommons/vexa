@@ -37,6 +37,11 @@ starts, then ``spoken`` with ``duration_ms`` or ``failed`` with its reason, e.g.
 ``GET /bots/{platform}/{native_meeting_id}/speak/{request_id}`` reads it — ``queued``, ``speaking``,
 ``spoken`` (with ``duration_ms``, the milliseconds of audio played) or ``failed`` (with ``reason``;
 ``unconfirmed`` when no answer came within ``SPEAK_UNCONFIRMED_AFTER_SEC``) (``speak_delivery.py``).
+The read also says when: ``queued_at``, ``speaking_at``, ``first_audio_at`` and ``spoken_at`` (ISO
+8601 UTC, each present once known), and on a spoken line the bot's own measurements in whole
+milliseconds from the moment it took the act: ``first_audio_ms`` (to the first audio), ``synth_ms``
+(of that, waiting on the TTS service; 0 for a cached first sentence), ``queue_ms`` (behind earlier
+lines), ``mic_ms`` (on the meeting mic), and ``cached`` (every sentence came from the clip cache).
 Lines play one after another, so a caller pacing its lines waits for ``spoken`` or ``failed``. The
 record is written before the act goes out and removed again when nothing received it. The status
 read answers the SENDER only; ``404`` for an id that is unknown, expired, another user's, or not of
@@ -55,7 +60,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 
 from ..bot_spawn.ports import MeetingRepo
 from ..regime import live_bot_guard
-from ..speak_delivery import SpeakDeliveryLedger
+from ..speak_delivery import SpeakDeliveryLedger, speak_timeline
 from .chat_router import ChatRateLimit
 from .stop import leave_command_channel
 from .stop_router import _SUPPORTED_PLATFORMS, CommandPublisher, _active_rows, _resolve_user_id
@@ -245,6 +250,9 @@ def build_speak_router(repo: MeetingRepo, publisher: CommandPublisher,
             "meeting_id": record.get("meeting_id"),
             "native_meeting_id": native_meeting_id,
         }
+        # When the line was queued, started, first heard and finished, and the bot's own timing
+        # (`first_audio_ms`, `synth_ms`, `queue_ms`, `mic_ms`, `cached`): whatever is known so far.
+        answer.update(speak_timeline(record))
         if record["status"] == "spoken":
             answer["duration_ms"] = int(record.get("duration_ms") or 0)
         if record["status"] == "failed":

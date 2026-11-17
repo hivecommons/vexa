@@ -79,7 +79,15 @@ export interface GmeetPipelineOptions {
    *  through the same transcribe (so the bot's shared STT gate counts it) and waits while that gate
    *  backs off; past `reconfirmHoldMs`, or if it fails or comes back empty, the drafts are confirmed
    *  as they are — reconfirmation may lag under overload, it never loses words. 0 disables (the
-   *  lane's confirmed windows are published as they are). Default 0. */
+   *  lane's confirmed windows are published as they are). Default 0.
+   *
+   *  Two cases never pay a second round trip after the speaker stops:
+   *   - a group that is ONE draft, and that draft is the answer to a final window (the utterance was
+   *     transcribed whole, in one request, once the speaker stopped): transcribing the same audio
+   *     again adds nothing, so the draft is confirmed as it is;
+   *   - a group with earlier drafts whose utterance just ended: the reconfirmation request over the
+   *     whole group is sent at the end of the utterance, beside the last window's own request, and
+   *     its answer is used when the group closes (as long as nothing was said after it). */
   reconfirmSec?: number;
   /** Pause (ms) after a speaker's last draft that closes the group. Default 1500. */
   reconfirmIdleMs?: number;
@@ -201,14 +209,23 @@ export function createGmeetPipeline(opts: GmeetPipelineOptions): GmeetPipeline {
   const RECONFIRM_IDLE = opts.reconfirmIdleMs ?? 1500;
   const RECONFIRM_HOLD = opts.reconfirmHoldMs ?? 15_000;
   const RECONFIRM_QUIET = opts.reconfirmQuietMs ?? DEFAULT_RECONFIRM_QUIET_MS;
-  type Frag = { name: string; text: string; startMs: number; endMs: number; lang?: string };
-  type Group = { key: string; frags: Frag[]; lastAt: number; settled?: boolean };
+  type Frag = { name: string; text: string; startMs: number; endMs: number; lang?: string; final?: boolean };
+  /** A reconfirmation sent at the end of the utterance: the group's audio from its first draft up
+   *  to `toMs` (capture time), and the answer (null when the request failed). */
+  type Early = { firstStartMs: number; toMs: number; answer: Promise<TranscriptionResult | null> };
+  type Group = { key: string; frags: Frag[]; lastAt: number; settled?: boolean; early?: Early };
   const groups = new Map<string, Group>();
   /** Per stream key: the frames it was fed (capture time), kept only as long as a group may need them. */
   const audio = new Map<string, { ts: number; pcm: Float32Array }[]>();
   const pending = new Set<Group>();          // groups whose reconfirmation is in flight
   const heldIds = new Set<string>();         // draft ids awaiting reconfirmation
-  let reconfirmCalls = 0, reconfirmed = 0, promoted = 0;
+  let reconfirmCalls = 0, reconfirmed = 0, promoted = 0, keptFinals = 0, earlyUsed = 0;
+  /** Per stream key: when its last frame arrived (wall clock), for the "final after" log line. */
+  const lastFedAt = new Map<string, number>();
+  const sinceLastAudio = (key: string): string => {
+    const at = lastFedAt.get(key);
+    return at === undefined ? 'n/a' : `${Date.now() - at} ms`;
+  };
   const publishFrag = (key: string, f: Frag, completed: boolean) =>
     completed ? opts.sink.segment(segOf(f.name, key, f.text, f.startMs, f.endMs, true, f.lang))
       : opts.sink.draft ? opts.sink.draft({ ...segOf(f.name, key, f.text, f.startMs, f.endMs, false, f.lang), confidence: 0 })
@@ -226,30 +243,64 @@ export function createGmeetPipeline(opts: GmeetPipelineOptions): GmeetPipeline {
     let o = 0; for (const x of fr) { out.set(x.pcm, o); o += x.pcm.length; }
     return out;
   };
+  const reconfirmRequest = (key: string, pcm: Float32Array): Promise<TranscriptionResult> => {
+    reconfirmCalls++;
+    const pinned = langs.get(channelOf(key))?.pinned;
+    const prompt = lastReconfirmed.get(channelOf(key));
+    return opts.transcribe(pcm, prompt || undefined, pinned ? { language: pinned } : undefined);
+  };
+  /** Publish a group's one confirmed segment (under the first draft's id) and withdraw the rest. */
+  const settleWith = (g: Group, text: string, lang?: string) => {
+    const first = g.frags[0], last = g.frags[g.frags.length - 1];
+    g.settled = true;
+    const name = chanName.get(g.key) ?? first.name;
+    opts.sink.segment(segOf(name, g.key, text, first.startMs, last.endMs, true, lang ?? first.lang));
+    for (const f of g.frags.slice(1)) opts.sink.draft?.({ ...segOf(name, g.key, '', f.startMs, f.endMs, false, f.lang), confidence: 0 });
+    lastReconfirmed.set(channelOf(g.key), text.slice(-200));
+  };
   const reconfirm = async (g: Group): Promise<void> => {
     const first = g.frags[0], last = g.frags[g.frags.length - 1];
     const pcm = sliceAudio(g.key, first.startMs - 300, last.endMs + 300);
     // Trim what no later group needs (groups of one key run in order).
     const kept = (audio.get(g.key) ?? []).filter((x) => x.ts + x.pcm.length / 16 > last.endMs - 300);
     audio.set(g.key, kept);
+    if (g.frags.length === 1 && first.final) {
+      // The utterance was transcribed whole, in one request, after the speaker stopped: that answer
+      // is the confirmed text. (Published under the stream's current name, so a name bound after
+      // the draft went out is the one on the segment.)
+      keptFinals++;
+      settleWith(g, first.text, first.lang);
+      log(`[gmeet-pipeline] final for ${g.key}: one final window, confirmed as transcribed (${sinceLastAudio(g.key)} after its last audio)`);
+      return;
+    }
     if (pcm.length < 16000 * 0.5) { promote(g, 'audio too short to reconfirm'); return; }
+    // The request sent at the end of the utterance answers for this group when nothing was said
+    // after it and the group still starts where it did.
+    const early = g.early && g.early.firstStartMs === first.startMs && g.early.toMs >= last.endMs ? g.early : undefined;
+    if (early) {
+      const r = await early.answer;
+      if (g.settled) return;
+      const text = (r?.text ?? '').replace(/\s+/g, ' ').trim();
+      if (text && !isHallucination(text, { voiced: true })) {
+        reconfirmed++; earlyUsed++;
+        settleWith(g, text, langOf(r?.language));
+        log(`[gmeet-pipeline] final for ${g.key}: ${g.frags.length} draft(s) reconfirmed by the request sent at the end of the utterance (${sinceLastAudio(g.key)} after its last audio)`);
+        return;
+      }
+      // No usable answer from it: the group is reconfirmed the ordinary way below.
+    }
     const holdUntil = Date.now() + RECONFIRM_HOLD;
     while (sttPressure?.backingOff() && Date.now() < holdUntil && !g.settled) await new Promise((r) => setTimeout(r, 250));
     if (g.settled) return;
     if (sttPressure?.backingOff()) { promote(g, 'stt backing off'); return; }
     try {
-      reconfirmCalls++;
-      const pinned = langs.get(channelOf(g.key))?.pinned;
-      const prompt = lastReconfirmed.get(channelOf(g.key));
-      const r = await opts.transcribe(pcm, prompt || undefined, pinned ? { language: pinned } : undefined);
+      const r = await reconfirmRequest(g.key, pcm);
       if (g.settled) return;                    // abandoned while in flight: the drafts were confirmed
       const text = (r?.text ?? '').replace(/\s+/g, ' ').trim();
       if (!text || isHallucination(text, { voiced: true })) { promote(g, 'empty answer'); return; }
-      g.settled = true; reconfirmed++;
-      const name = chanName.get(g.key) ?? first.name;
-      opts.sink.segment(segOf(name, g.key, text, first.startMs, last.endMs, true, langOf(r?.language) ?? first.lang));
-      for (const f of g.frags.slice(1)) opts.sink.draft?.({ ...segOf(name, g.key, '', f.startMs, f.endMs, false, f.lang), confidence: 0 });
-      lastReconfirmed.set(channelOf(g.key), text.slice(-200));
+      reconfirmed++;
+      settleWith(g, text, langOf(r?.language));
+      log(`[gmeet-pipeline] final for ${g.key}: ${g.frags.length} draft(s) reconfirmed (${sinceLastAudio(g.key)} after its last audio)`);
     } catch (e) {
       opts.onError?.(e);
       promote(g, 'stt fault');
@@ -278,10 +329,30 @@ export function createGmeetPipeline(opts: GmeetPipelineOptions): GmeetPipeline {
   }, RECONFIRM_SWEEP_MS) : undefined;
   (sweep as { unref?: () => void } | undefined)?.unref?.();
 
-  mgr.onSegmentConfirmed = (speakerId, speakerName, text, startMs, endMs, _segmentId, lang) => {
+  // The utterance ended and its last window is on its way to STT. A group that already holds
+  // drafts will be reconfirmed over all of its audio once that window answers: that request is
+  // sent NOW, so both answers arrive together instead of one round trip after the other.
+  mgr.onUtteranceEnd = (speakerId) => {
+    const g = groups.get(speakerId);
+    if (RECONFIRM_MS <= 0 || !g || !g.frags.length || g.early || sttPressure?.backingOff()) return;
+    const frames = audio.get(speakerId) ?? [];
+    const lastFrame = frames[frames.length - 1];
+    if (!lastFrame) return;
+    const firstStartMs = g.frags[0].startMs;
+    const toMs = lastFrame.ts + lastFrame.pcm.length / 16;
+    const pcm = sliceAudio(speakerId, firstStartMs - 300, toMs);
+    if (pcm.length < 16000 * 0.5) return;
+    const answer = reconfirmRequest(speakerId, pcm).then((r) => r, (e) => { opts.onError?.(e); return null; });
+    g.early = { firstStartMs, toMs, answer };
+    const p = answer.then(() => undefined);
+    inflight.add(p);
+    void p.finally(() => inflight.delete(p));
+  };
+
+  mgr.onSegmentConfirmed = (speakerId, speakerName, text, startMs, endMs, _segmentId, lang, final) => {
     if (!text.trim()) return;
     if (RECONFIRM_MS <= 0) { opts.sink.segment(segOf(speakerName, speakerId, text, startMs, endMs, true, lang)); return; }
-    const f: Frag = { name: speakerName, text, startMs, endMs, lang };
+    const f: Frag = { name: speakerName, text, startMs, endMs, lang, final: final === true };
     heldIds.add(segOf(speakerName, speakerId, '', startMs, startMs, false).segment_id);
     publishFrag(speakerId, f, false);           // shown at once, as a draft
     const g = groups.get(speakerId) ?? { key: speakerId, frags: [], lastAt: Date.now() };
@@ -310,7 +381,9 @@ export function createGmeetPipeline(opts: GmeetPipelineOptions): GmeetPipeline {
       if (mgr.isSettled(key) || Date.now() - closedAt > SETTLE_CAP) {
         closeGroup(key);
         mgr.removeSpeaker(key);
-        const t2 = setTimeout(() => { if (![...pending].some((g) => g.key === key) && !groups.has(key)) audio.delete(key); }, RECONFIRM_HOLD + 120_000);
+        const t2 = setTimeout(() => {
+          if (![...pending].some((g) => g.key === key) && !groups.has(key)) { audio.delete(key); lastFedAt.delete(key); }
+        }, RECONFIRM_HOLD + 120_000);
         (t2 as { unref?: () => void }).unref?.();
         return;
       }
@@ -376,6 +449,7 @@ export function createGmeetPipeline(opts: GmeetPipelineOptions): GmeetPipeline {
         mgr.updateSpeakerName(st.key, glowName);
       }
       st.lastMs = tsMs;
+      lastFedAt.set(st.key, Date.now());
       if (RECONFIRM_MS > 0) {
         chanName.set(st.key, st.name);
         const fr = audio.get(st.key) ?? [];
@@ -415,7 +489,8 @@ export function createGmeetPipeline(opts: GmeetPipelineOptions): GmeetPipeline {
       await settle();
       for (const g of [...pending]) promote(g, 'dispose');
       if (sweep) clearInterval(sweep);
-      if (RECONFIRM_MS > 0) log(`[gmeet-pipeline] [RECONFIRM] reconfirmed=${reconfirmed} confirmed-as-drafted=${promoted} requests=${reconfirmCalls}`);
+      if (RECONFIRM_MS > 0) log(`[gmeet-pipeline] [RECONFIRM] reconfirmed=${reconfirmed} confirmed-as-drafted=${promoted} requests=${reconfirmCalls} ` +
+        `final-windows-kept=${keptFinals} answered-by-end-of-utterance-request=${earlyUsed}`);
       if (coverageTimer) clearInterval(coverageTimer);
       if (progressTimer) clearInterval(progressTimer);
       logCoverage(true);

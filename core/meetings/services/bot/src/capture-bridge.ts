@@ -828,7 +828,7 @@ export async function startCaptureBridge(
   // left for STT (chunks, audio seconds, bytes), plus when the first chunk went out relative to
   // capture start. "Audio arrives, nothing is transcribed" and "nothing arrives" read differently.
   const audioDiagTimer = useMix ? setInterval(() => {
-    console.log(audioDiag.line(pipeline.sttCounters));
+    console.log(audioDiag.line(pipeline.sttCounters, pipeline.laneDiag?.()));
   }, AUDIO_DIAG_INTERVAL_MS) : null;
   audioDiagTimer?.unref?.();
 
@@ -859,7 +859,7 @@ export async function startCaptureBridge(
   // ── Start the page-side capture (VexaBrowserUtils preferred; production inline fallback). ──
   // The body of this callback runs IN THE BROWSER (Playwright serializes it); DOM globals are
   // reached via globalThis (this file type-checks against the Node lib — no DOM types here).
-  await page.evaluate(async ({ isMixed, isPerTrack, isJitsi, isTeams, isZoom, botName, mainAudioGraceMs, mainAudioSilenceMs, mainAudioEnergyRms, mixAudioDiagMs }) => {
+  await page.evaluate(async ({ isMixed, isPerTrack, isJitsi, isTeams, isZoom, botName, mainAudioGraceMs, mainAudioSilenceMs, mainAudioEnergyRms, mixAudioDiagMs, teamsSpeechHangoverMs }) => {
     const w = (globalThis as any) as Record<string, any>;
     if (isMixed) {
       // Zoom/Teams/Jitsi ride the WebRTC hook (installRemoteAudioHook, installed pre-nav), which mirrors
@@ -1189,7 +1189,10 @@ export async function startCaptureBridge(
             // speaker-hint binder align frames to hints; without it ~3/4 of hints missed → misattribution.
             w.__vexaPerSpeakerAudioData(0, Array.from(pcm), tsMs);
           };
-          Promise.resolve(w.VexaBrowserUtils.createMixedAudioCapture(w.__vexaMixDest.stream, meterAndForward))
+          // Teams' lane cuts turns on transport edges, so its utterances cross whole: the silent
+          // frame before an onset and the pauses inside and just after speech ride along.
+          const captureOpts = isTeams ? { speechHangoverMs: teamsSpeechHangoverMs } : undefined;
+          Promise.resolve(w.VexaBrowserUtils.createMixedAudioCapture(w.__vexaMixDest.stream, meterAndForward, captureOpts))
             .then((cap: any) => {
               w.__vexaMixedCapture = cap;
               // THE CLOCK STARTS WHEN CAPTURE STARTS, NOT WHEN AUDIO ARRIVES.
@@ -1238,8 +1241,22 @@ export async function startCaptureBridge(
                 tracks.push(String(t.id || '').slice(0, 8) + ':' + t.readyState + (t.muted ? ':muted' : ''));
               }
             }
-            w.logBot?.('[mixed] audio-diag ctx=' + state + ' frames=' + (w.__vexaMixDiagFrames || 0)
+            // The capture graph's own context is a second one: it can be suspended, or pulled at
+            // the wrong rate, while the mixing context reads 'running'. callbacks=0 means the
+            // processor is not being pulled at all; callbacks>0 with frames=0 means silence.
+            const cap = w.__vexaMixedCapture;
+            const cs = cap && typeof cap.stats === 'function' ? cap.stats() : null;
+            if (cs && cs.contextState === 'suspended') {
+              w.logBot?.('[mixed] capture AudioContext suspended: resuming');
+              try { cap.resume?.(); } catch { /* best-effort */ }
+            }
+            w.logBot?.('[mixed] audio-diag ctx=' + state
+              + ' cap-ctx=' + (cs ? cs.contextState : 'none') + ' sr=' + (cs ? cs.sampleRate : 0)
+              + ' callbacks=' + (cs ? cs.callbacks : 0) + ' gated=' + (cs ? cs.gated : 0)
+              + ' frames=' + (w.__vexaMixDiagFrames || 0)
               + ' rms=' + rms.toFixed(4) + ' energetic-ms=' + Math.round(w.__vexaMixEnergeticMs || 0)
+              + ' clock-lag-ms=' + (cs ? cs.clockLagMs : 0) + ' clock-reanchors=' + (cs ? cs.reanchors : 0)
+              + ' clock-lost-ms=' + (cs ? cs.lostMs : 0)
               + ' tracks=[' + tracks.join(',') + ']');
             w.__vexaMixDiagFrames = 0; w.__vexaMixDiagSamples = 0; w.__vexaMixDiagSumSq = 0;
           } catch { /* observability must never break capture */ }
@@ -1402,13 +1419,16 @@ export async function startCaptureBridge(
         ?? w.VexaBrowserUtils.createGmeetSpeakers?.({ log: (m: string) => w.logBot?.('[PerSpeaker] ' + m) });
       w.__vexaGmeetCapture = w.VexaBrowserUtils.createGmeetCapture({
         log: (m: string) => w.logBot?.('[PerSpeaker] ' + m),
-        onAudio: (index: number, pcm: Float32Array) => {
-          w.__vexaGmeetSpeakers?.reportTrackAudio?.(index);
+        onAudio: (index: number, pcm: Float32Array, meta?: { tsMs: number; voiced: boolean }) => {
+          // The quiet blocks kept around speech (pre-roll, post-roll) are audio for the transcript,
+          // not evidence that this track is speaking: only a loud block counts for attribution.
+          if (meta?.voiced !== false) w.__vexaGmeetSpeakers?.reportTrackAudio?.(index);
           // Bind the glow name at capture time (the v1 producer's inversion): exactly-one-lit ⇒ name.
           const lit: string[] = w.__vexaGmeetSpeakers?.litNames?.() ?? [];
           const glow = lit.length === 1 ? lit[0] : undefined;
-          if (glow) w.__vexaNamedAudioData(index, glow, Array.from(pcm), Date.now());
-          else w.__vexaPerSpeakerAudioData(index, Array.from(pcm), Date.now());
+          const tsMs = meta?.tsMs ?? Date.now();
+          if (glow) w.__vexaNamedAudioData(index, glow, Array.from(pcm), tsMs);
+          else w.__vexaPerSpeakerAudioData(index, Array.from(pcm), tsMs);
         },
       });
       await w.__vexaGmeetCapture.start();
@@ -1420,7 +1440,8 @@ export async function startCaptureBridge(
       // How long a PICKED mix may stay wholly silent before the lane abandons it for every track.
       mainAudioSilenceMs: Number(process.env.VEXA_TEAMS_MAIN_AUDIO_SILENCE_MS || 20000),
       mainAudioEnergyRms: Number(process.env.VEXA_TEAMS_MAIN_AUDIO_ENERGY_RMS || 0.006),
-      mixAudioDiagMs: AUDIO_DIAG_INTERVAL_MS }).catch((e) => {
+      mixAudioDiagMs: AUDIO_DIAG_INTERVAL_MS,
+      teamsSpeechHangoverMs: Number(process.env.VEXA_TEAMS_SPEECH_HANGOVER_MS ?? TEAMS_SPEECH_HANGOVER_MS) }).catch((e) => {
     console.error(`[bot] capture bridge: page-side start failed: ${String(e)}`); // L4: surfaces only on the VM
   });
 
@@ -1571,14 +1592,24 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
  *  unmuted, so the line was NOT played (TTS into a muted mic is heard by no one). */
 export type SpeakFailure = 'voice_disabled' | 'mic_muted' | 'tts_failed' | 'stopped';
 
+/** Where one line's time went, in milliseconds. `queueMs`: waiting behind earlier lines. `micMs`:
+ *  reading the meeting-UI mic (and opening it when it was shut). `firstAudioMs`: from the moment
+ *  the bot took the line to the first PCM handed to the player (queue + mic + the synthesis of the
+ *  first sentence); absent when the TTS half does not report it. `synthMs`: of that, the wait on
+ *  the TTS service (0 when the first sentence was cached). `cached`: every sentence of the line
+ *  came from the clip cache. `totalMs`: until playback ended. */
+export interface SpeakTiming { queueMs: number; micMs: number; firstAudioMs?: number; synthMs?: number; cached?: boolean; totalMs: number }
+
 /** The outcome of one speak: spoken only once the mic was confirmed open and TTS played.
  *  `durationMs` is the audio actually played, in milliseconds. `stopped`: a barge-in (speak_stop)
  *  cancelled the line before it played. */
-export type SpeakResult = { spoken: true; durationMs: number } | { spoken: false; reason: SpeakFailure };
+export type SpeakResult = { spoken: true; durationMs: number; timing?: SpeakTiming } | { spoken: false; reason: SpeakFailure };
 
-/** Per-line callbacks. `onStart` fires once the mic is confirmed open, right before playback. */
+/** Per-line callbacks. `onStart` fires once the mic is confirmed open, right before synthesis and
+ *  playback; `onFirstAudio` when the first PCM of the line reaches the player. */
 export interface SpeakHooks {
   onStart?: () => void;
+  onFirstAudio?: (msSinceReceived: number) => void;
 }
 
 export interface SpeakController {
@@ -1588,15 +1619,29 @@ export interface SpeakController {
   speak(text: string, voice?: string, hooks?: SpeakHooks): Promise<SpeakResult>;
   /** Stop the playing line and drop every queued one (barge-in). */
   stop(): Promise<void>;
+  /** Open the meeting-UI mic now (the bot is in the meeting), so the first line does not pay for
+   *  it. Bounded, best-effort, a no-op for a bot that cannot speak; every line still checks. */
+  prepare(): Promise<void>;
+  /** Resolves once no line is playing or queued. */
+  idle(): Promise<void>;
 }
 
 /** The meeting-UI mic as the page shows it. */
 export type MicState = 'muted' | 'unmuted' | 'unknown';
 
-/** How long the meeting UI gets to repaint the mic control after a toggle. */
+/** How long the meeting UI gets to repaint the mic control after a toggle (the most one attempt
+ *  waits; the control is read every MIC_POLL_MS and the wait ends as soon as it reads open). */
 export const MIC_SETTLE_MS = 400;
+/** How often the control is read again after a toggle. */
+export const MIC_POLL_MS = 40;
 /** Toggle attempts before the mic is reported as stuck muted. */
 export const MIC_UNMUTE_ATTEMPTS = 3;
+/** After admission the mic control may not be drawn yet: `prepare` looks for it this long... */
+export const MIC_PREPARE_WAIT_MS = 15_000;
+/** ...this often. */
+export const MIC_PREPARE_POLL_MS = 500;
+/** A mic read slower than this is logged (it is one in-page attribute read). */
+const MIC_SLOW_READ_MS = 100;
 
 /** Each platform's keyboard mute toggle — the fallback when no mic button can be clicked. */
 const MIC_TOGGLE_SHORTCUT: Record<string, string> = {
@@ -1664,7 +1709,10 @@ export function createSpeakController(
   page: Page,
   inv: Invocation,
   /** The OS-level TTS→tts_sink half; injectable so the mic gate is provable without PulseAudio. */
-  ttsPlayback?: { speak(text: string, voice?: string): Promise<number | void>; stop(): void },
+  ttsPlayback?: {
+    speak(text: string, voice?: string, hooks?: { onFirstAudio?: () => void; onLine?: (stats: { synthMs: number; cached: boolean }) => void }): Promise<number | void>;
+    stop(): void;
+  },
 ): SpeakController {
   const enabled = !!inv.voiceAgentEnabled;
   const platform = inv.platform;
@@ -1679,49 +1727,81 @@ export function createSpeakController(
 
   /**
    * Open the meeting-UI mic and CONFIRM it is open. The mic stays open once opened: the virtual
-   * mic carries only TTS (silence between lines), so an open mic sends nothing but the bot's own
-   * speech, while a mute/unmute pair around every line is two more UI races per line and clips the
-   * first syllable on every unmute. It is re-checked before every line, so a host's "mute all" or a
-   * join that left the mic off is caught and repaired before the line plays, never after.
+   * mic carries only TTS (digital silence between lines: nothing else plays into its sink, and the
+   * sink is muted outside playback), so an open mic sends nothing but the bot's own speech, while
+   * a mute/unmute pair around every line is two more UI races per line and clips the first syllable
+   * on every unmute. It is opened once when the bot is admitted (`prepare`) and re-checked before
+   * every line by ONE in-page read of the control's own attributes (milliseconds, no waiting), so
+   * a host's "mute all" or a join that left the mic off is caught and repaired before the line
+   * plays, never after. Only a mic that reads shut is toggled; the wait after a toggle ends as
+   * soon as the control reads open.
    */
   const ensureMicOpen = async (): Promise<boolean> => {
+    const started = Date.now();
     for (let attempt = 0; attempt <= MIC_UNMUTE_ATTEMPTS; attempt++) {
+      const readAt = Date.now();
       const mic = await readMic();
-      if (mic.state === 'unmuted') return true;
+      const readMs = Date.now() - readAt;
+      if (mic.state === 'unmuted') {
+        if (attempt > 0 || readMs >= MIC_SLOW_READ_MS) console.log(`[bot] speak: mic open after ${attempt} toggle(s), ${Date.now() - started} ms (last read ${readMs} ms)`);
+        return true;
+      }
       if (attempt === MIC_UNMUTE_ATTEMPTS) {
-        console.error(`[bot] speak: mic not confirmed open after ${MIC_UNMUTE_ATTEMPTS} toggle(s) (control ${mic.found ? 'found' : 'missing'}, state ${mic.state})`);
+        console.error(`[bot] speak: mic not confirmed open after ${MIC_UNMUTE_ATTEMPTS} toggle(s) in ${Date.now() - started} ms (control ${mic.found ? 'found' : 'missing'}, state ${mic.state})`);
         return false;
       }
       // A readable control that says muted is clicked; with no readable control the platform's
       // keyboard toggle is the only lever (its effect is verified by the next read, never assumed).
+      const toggledAt = Date.now();
       if (mic.found) {
         await micControl(page, platform, true).catch(() => undefined);
       } else if (MIC_TOGGLE_SHORTCUT[platform]) {
         await page.keyboard.press(MIC_TOGGLE_SHORTCUT[platform]).catch(() => undefined);
       }
-      console.log(`[bot] speak: mic ${mic.state}, toggled (attempt ${attempt + 1}/${MIC_UNMUTE_ATTEMPTS})`);
-      await page.waitForTimeout(MIC_SETTLE_MS).catch(() => undefined);
+      // The repaint is awaited only as long as it takes: read every MIC_POLL_MS, up to MIC_SETTLE_MS.
+      let opened = false;
+      while (Date.now() - toggledAt < MIC_SETTLE_MS) {
+        if ((await readMic()).state === 'unmuted') { opened = true; break; }
+        await page.waitForTimeout(MIC_POLL_MS).catch(() => undefined);
+      }
+      console.log(`[bot] speak: mic ${mic.state}, toggled (attempt ${attempt + 1}/${MIC_UNMUTE_ATTEMPTS}): read ${readMs} ms, ${opened ? 'open' : 'not open'} ${Date.now() - toggledAt} ms after the toggle`);
     }
     return false;
   };
 
-  const speakOne = async (text: string, voice?: string, hooks?: SpeakHooks): Promise<SpeakResult> => {
+  const speakOne = async (text: string, voice: string | undefined, hooks: SpeakHooks | undefined, receivedAt: number): Promise<SpeakResult> => {
+    const startedAt = Date.now();
+    const queueMs = startedAt - receivedAt;
     console.log(`[bot] speak: "${text.slice(0, 60)}"`);
     if (!(await ensureMicOpen())) {
       console.error('[bot] speak_failed reason=mic_muted — the line was not played');
       return { spoken: false, reason: 'mic_muted' };
     }
-    // Synthesize via the TTS service + stream PCM to tts_sink → virtual_mic (the bot's mic).
+    const micMs = Date.now() - startedAt;
+    // Synthesize via the TTS service + write PCM to tts_sink → virtual_mic (the bot's mic).
     let durationMs: number;
+    let firstAudioMs: number | undefined;
+    let line: { synthMs: number; cached: boolean } | undefined;
     try {
       try { hooks?.onStart?.(); } catch { /* a report hook never stops the line */ }
-      durationMs = await tts.speak(text, voice) ?? 0;
+      durationMs = await tts.speak(text, voice, {
+        onFirstAudio: () => {
+          firstAudioMs = Date.now() - receivedAt;
+          try { hooks?.onFirstAudio?.(firstAudioMs); } catch { /* a report hook never stops the line */ }
+        },
+        onLine: (stats) => { line = stats; },
+      }) ?? 0;
     } catch (e) {
       console.error(`[bot] speak_failed reason=tts_failed: ${String(e)}`);
       return { spoken: false, reason: 'tts_failed' };
     }
-    console.log(`[bot] speak: spoken duration_ms=${durationMs} (mic confirmed open)`);
-    return { spoken: true, durationMs };
+    const timing: SpeakTiming = {
+      queueMs, micMs, ...(firstAudioMs !== undefined ? { firstAudioMs } : {}),
+      ...(line ? { synthMs: line.synthMs, cached: line.cached } : {}), totalMs: Date.now() - receivedAt,
+    };
+    console.log(`[bot] speak: spoken duration_ms=${durationMs} (mic confirmed open) queue_ms=${queueMs} mic_ms=${micMs} `
+      + `first_audio_ms=${firstAudioMs ?? 'n/a'} synth_ms=${line?.synthMs ?? 'n/a'} cached=${line?.cached ?? 'n/a'} total_ms=${timing.totalMs}`);
+    return { spoken: true, durationMs, timing };
   };
 
   // ONE line at a time. Acts arrive concurrently (each act is handled as it lands), and two
@@ -1735,6 +1815,7 @@ export function createSpeakController(
     async speak(text: string, voice?: string, hooks?: SpeakHooks): Promise<SpeakResult> {
       if (!enabled) { console.error('[bot] speak ignored: voiceAgentEnabled is false'); return { spoken: false, reason: 'voice_disabled' }; }
       const mine = generation;
+      const receivedAt = Date.now();
       if (queued > 0) console.log(`[bot] speak: queued behind ${queued} line(s)`);
       queued++;
       const run = tail.then(async (): Promise<SpeakResult> => {
@@ -1742,7 +1823,7 @@ export function createSpeakController(
           console.log('[bot] speak: dropped by speak_stop before it played');
           return { spoken: false, reason: 'stopped' };
         }
-        return speakOne(text, voice, hooks);
+        return speakOne(text, voice, hooks, receivedAt);
       }).finally(() => { queued--; });
       tail = run.catch(() => undefined);
       return run;
@@ -1752,6 +1833,30 @@ export function createSpeakController(
       generation++;                                           // drop every line still queued
       tts.stop();                                             // barge-in: kill playback + re-mute tts_sink
       console.log('[bot] speak_stop');
+    },
+    async prepare(): Promise<void> {
+      if (!enabled) return;
+      const started = Date.now();
+      // The control is looked for outside the line queue, so a line that arrives meanwhile never
+      // waits on this; only the toggle itself takes its turn in the queue.
+      while (Date.now() - started < MIC_PREPARE_WAIT_MS) {
+        if (queued > 0) return;                               // a line is on its way: it opens the mic itself
+        const mic = await readMic();
+        if (mic.state === 'unmuted') { console.log(`[bot] speak: mic open at join (${Date.now() - started} ms)`); return; }
+        if (mic.found && mic.state === 'muted') {
+          const run = tail.then(() => ensureMicOpen());
+          tail = run.catch(() => undefined);
+          const ok = await run.catch(() => false);
+          console.log(`[bot] speak: mic ${ok ? 'opened' : 'NOT opened'} at join (${Date.now() - started} ms)`);
+          return;
+        }
+        await page.waitForTimeout(MIC_PREPARE_POLL_MS).catch(() => undefined);
+      }
+      console.log(`[bot] speak: no readable mic control ${MIC_PREPARE_WAIT_MS} ms after join; the first line opens the mic`);
+    },
+    async idle(): Promise<void> {
+      // A line queued while this waits extends the wait: the tail is followed until it stops moving.
+      for (let seen: Promise<unknown> | null = null; seen !== tail;) { seen = tail; await seen; }
     },
   };
 }
@@ -1766,9 +1871,10 @@ export function createSpeakController(
  * cannot run (no Playwright locator, or a step throws before the line went out), the page-side
  * sendGmeetChatMessage (DOM value + click / synthetic Enter) is the fallback. Either way the send
  * counts only when the line shows in Meet's message list (awaitGmeetChatLanded). teams runs the same
- * trusted driver over teams-chat.ts's prepareTeamsChatSend / awaitTeamsChatLanded (Teams' composer is
- * a rich-text editor, so Playwright's fill is the reliable input), with sendTeamsChatMessage
- * (insertText + click / synthetic Enter) as its page-side fallback. jitsi calls the conference's own
+ * trusted driver over teams-chat.ts's prepareTeamsChatSend / awaitTeamsChatLanded; Teams' composer is
+ * a rich-text editor (a CKEditor contenteditable), which fill cannot drive, so the driver clicks
+ * it, inserts the text as keyboard input and checks the editor holds it before pressing send, with
+ * sendTeamsChatMessage (insertText / beforeinput + click / synthetic Enter) as its page-side fallback. jitsi calls the conference's own
  * sendTextMessage (sendJitsiChatMessage). Not gated on voiceAgentEnabled: chat is a text act, not a
  * voice one. Every other platform reports `unsupported_platform`.
  *
@@ -1785,7 +1891,11 @@ export type ChatSendFailure =
   | 'empty_text';
 
 /** The outcome of one chat_send: sent only once the line is in the meeting. */
-export type ChatSendResult = { sent: true; via: string } | { sent: false; reason: ChatSendFailure };
+export type ChatSendResult =
+  | { sent: true; via: string }
+  /** `step` is the bot's own finer account of where the send stopped (logged, never reported on
+   *  the wire, whose vocabulary is ChatSendFailure). */
+  | { sent: false; reason: ChatSendFailure; step?: string };
 
 export interface ChatSender {
   /** Send `text` into the meeting chat. Resolves `sent: true` only once the line is in the meeting. */
@@ -1796,11 +1906,29 @@ export interface ChatSender {
 const GMEET_CHAT_LAND_WAIT_MS = Number(process.env.VEXA_GMEET_CHAT_LAND_WAIT_MS || 8000);
 
 /** The page-side helpers (on VexaBrowserUtils) one platform's trusted send drives. */
-interface TrustedChatHelpers { prepare: string; landed: string }
+interface TrustedChatHelpers {
+  prepare: string;
+  landed: string;
+  /** How the text goes into the marked composer. 'fill' (default) is Playwright's fill, right for
+   *  an <input>/<textarea>. 'type' clicks the composer and inserts the text through the keyboard,
+   *  the input a rich-text editor (Teams' CKEditor contenteditable) acts on; `holds` then names
+   *  the page-side check that the editor took it. */
+  input?: 'fill' | 'type';
+  holds?: string;
+}
 const TRUSTED_CHAT_HELPERS: Record<string, TrustedChatHelpers> = {
   google_meet: { prepare: 'prepareGmeetChatSend', landed: 'awaitGmeetChatLanded' },
-  teams: { prepare: 'prepareTeamsChatSend', landed: 'awaitTeamsChatLanded' },
+  teams: { prepare: 'prepareTeamsChatSend', landed: 'awaitTeamsChatLanded', input: 'type', holds: 'markedTeamsComposerHolds' },
 };
+
+/** A typed line goes in as one paragraph: Enter sends in a chat editor, so line breaks become
+ *  single spaces. */
+export function chatTypedText(text: string): string {
+  return text.replace(/\s*[\r\n]+\s*/g, ' ').trim();
+}
+
+/** How long the trusted path waits to click (focus) the composer before typing into it. */
+const TRUSTED_CHAT_FOCUS_TIMEOUT_MS = 2000;
 
 /** How long a send waits for the platform's chat composer to show (the page-side helpers open the
  *  panel and poll). Unset, each platform's helper uses its own default (Teams: 10 s, which outlasts
@@ -1827,7 +1955,7 @@ async function composerVanished(page: Page): Promise<boolean> {
 async function sendChatTrusted(page: Page, text: string, landWaitMs: number, helpers: TrustedChatHelpers, composerWaitMs: number | undefined = CHAT_COMPOSER_WAIT_MS): Promise<ChatSendResult | null> {
   if (typeof (page as { locator?: unknown }).locator !== 'function') return null;
   for (let attempt = 1; attempt <= TRUSTED_CHAT_ATTEMPTS; attempt++) {
-    let found: { composer: string | null; send: string | null; before: number } | null = null;
+    let found: { composer: string | null; send: string | null; before: number; step?: string } | null = null;
     const landed = () => page.evaluate(async ({ text, before, waitMs, fn }) => {
       const u = (globalThis as any).VexaBrowserUtils;
       return u?.[fn] ? !!(await u[fn](text, before, waitMs)) : false;
@@ -1837,12 +1965,36 @@ async function sendChatTrusted(page: Page, text: string, landWaitMs: number, hel
         const u = (globalThis as any).VexaBrowserUtils;
         if (!u?.[fn]) return null;
         const log = (m: string) => (globalThis as any).logBot?.('[ChatSend] ' + m);
-        return await u[fn](text, { log, waitMs }) as { composer: string | null; send: string | null; before: number };
+        return await u[fn](text, { log, waitMs }) as { composer: string | null; send: string | null; before: number; step?: string };
       }, { text, fn: helpers.prepare, waitMs: composerWaitMs });
       if (!found) return null;
-      if (!found.composer) return { sent: false, reason: 'no_composer' };
+      if (!found.composer) return { sent: false, reason: 'no_composer', ...(found.step ? { step: found.step } : {}) };
       const composer = page.locator('[data-vexa-chat-composer]').first();
-      await composer.fill(text, { timeout: 5000 });
+      const keyboard = (page as { keyboard?: { insertText?: (t: string) => Promise<void>; press?: (k: string) => Promise<void> } }).keyboard;
+      let entry = 'fill';
+      if (helpers.input === 'type' && typeof keyboard?.insertText === 'function') {
+        // A rich-text editor ignores fill. Click it (focus + caret), replace whatever it holds,
+        // and insert the text as keyboard input, which the editor's own input handling takes.
+        const typed = chatTypedText(text);
+        await composer.click({ timeout: TRUSTED_CHAT_FOCUS_TIMEOUT_MS });
+        await keyboard.press?.('Control+A');
+        await keyboard.insertText(typed);
+        const holds = helpers.holds
+          ? await page.evaluate(({ text, fn }) => {
+              const u = (globalThis as any).VexaBrowserUtils;
+              return u?.[fn] ? !!u[fn](text) : true;
+            }, { text: typed, fn: helpers.holds })
+          : true;
+        if (!holds) {
+          // Nothing went in: pressing send would post nothing. The page-side sender tries the
+          // editor's other input paths next.
+          console.error(`[bot] chat_send: step=composer_empty: the composer (${found.composer}) did not take ${typed.length} typed chars; send not pressed, trying the page-side sender`);
+          return null;
+        }
+        entry = 'type';
+      } else {
+        await composer.fill(text, { timeout: 5000 });
+      }
       const send = page.locator('[data-vexa-chat-send]').first();
       let how: string;
       if (found.send && await send.isEnabled({ timeout: TRUSTED_CHAT_CLICK_TIMEOUT_MS }).catch(() => false)) {
@@ -1850,18 +2002,18 @@ async function sendChatTrusted(page: Page, text: string, landWaitMs: number, hel
         // or never "stable") is not waited on: Enter in the filled composer sends the same line.
         const clicked = await send.click({ timeout: TRUSTED_CHAT_CLICK_TIMEOUT_MS }).then(() => true, () => false);
         if (clicked) {
-          how = `trusted fill + click (composer via ${found.composer}, send via ${found.send})`;
+          how = `trusted ${entry} + click (composer via ${found.composer}, send via ${found.send})`;
         } else {
           await composer.press('Enter', { timeout: TRUSTED_CHAT_CLICK_TIMEOUT_MS });
-          how = `trusted fill + Enter after the send click timed out (composer via ${found.composer})`;
+          how = `trusted ${entry} + Enter after the send click timed out (composer via ${found.composer})`;
         }
       } else {
         await composer.press('Enter', { timeout: 5000 });
-        how = `trusted fill + Enter (composer via ${found.composer}, send via ${found.send ?? 'none'})`;
+        how = `trusted ${entry} + Enter (composer via ${found.composer}, send via ${found.send ?? 'none'})`;
       }
       if (await landed()) return { sent: true, via: attempt > 1 ? `${how}, attempt ${attempt}` : how };
       console.error(`[bot] chat_send: ${how} — the line did not show in the message list within ${landWaitMs} ms`);
-      return { sent: false, reason: 'not_landed' };
+      return { sent: false, reason: 'not_landed', step: 'not_in_list' };
     } catch (e) {
       // A step threw. If the line is in the list anyway it went out.
       if (found?.composer && await landed().catch(() => false)) return { sent: true, via: 'trusted (a step threw after the line went out)' };
@@ -1882,7 +2034,7 @@ export function createChatSender(page: Page, inv: Invocation, opts: { landWaitMs
   const composerWaitMs = opts.composerWaitMs ?? CHAT_COMPOSER_WAIT_MS;
   const report = (text: string, r: ChatSendResult): ChatSendResult => {
     if (r.sent) console.log(`[bot] chat_send: sent via ${r.via}: "${text.slice(0, 60)}"`);
-    else console.error(`[bot] chat_send_failed reason=${r.reason} platform=${platform} chars=${text.length}`);
+    else console.error(`[bot] chat_send_failed reason=${r.reason}${r.step ? ` step=${r.step}` : ''} platform=${platform} chars=${text.length}`);
     return r;
   };
   // Runs IN THE BROWSER; the platform's sender lives on the injected bundle.
@@ -1897,7 +2049,8 @@ export function createChatSender(page: Page, inv: Invocation, opts: { landWaitMs
         if (platform === 'teams') {
           if (!u?.sendTeamsChatMessage) return { sent: false, reason: 'no_chat_api' };
           const res = await u.sendTeamsChatMessage(text, { log, landWaitMs, waitMs: composerWaitMs });
-          return res.ok ? { sent: true, via: `page-side ${res.send} (composer via ${res.composer})` } : { sent: false, reason: res.reason };
+          return res.ok ? { sent: true, via: `page-side ${res.send} (composer via ${res.composer})` }
+            : { sent: false, reason: res.reason, ...(res.step ? { step: res.step } : {}) };
         }
         return u?.sendJitsiChatMessage && u.sendJitsiChatMessage(text)
           ? { sent: true, via: 'jitsi conference API' } : { sent: false, reason: 'no_chat_api' };
@@ -1932,13 +2085,18 @@ export function createChatSender(page: Page, inv: Invocation, opts: { landWaitMs
   };
 }
 
+/** How long the Teams capture keeps forwarding silent frames after speech (ms): three capture
+ *  frames, which spans the pauses inside a sentence and the transport's own 400 ms hold.
+ *  Override: VEXA_TEAMS_SPEECH_HANGOVER_MS (0 forwards audible frames only). */
+export const TEAMS_SPEECH_HANGOVER_MS = 768;
+
 /** How often the mixed lane logs its audio-hop diagnostics line. */
 export const AUDIO_DIAG_INTERVAL_MS = 10_000;
 
 /** Interval + cumulative audio statistics for the frames crossing the page boundary. */
 export function createAudioDiag(now: () => number = Date.now): {
   observe(pcm: Float32Array): void;
-  line(stt?: { chunks: number; audioSec: number; pcmBytes: number; firstChunkAtMs?: number }): string;
+  line(stt?: { chunks: number; audioSec: number; pcmBytes: number; firstChunkAtMs?: number }, lane?: string): string;
 } {
   const startedMs = now();
   let totalFrames = 0;
@@ -1960,13 +2118,14 @@ export function createAudioDiag(now: () => number = Date.now): {
         if (a > peak) peak = a;
       }
     },
-    line(stt) {
+    line(stt, lane) {
       const rms = samples ? Math.sqrt(sumSq / samples) : 0;
       const since = (t?: number): string => (t === undefined ? 'none' : `${t - startedMs}ms`);
       const out = `[bot] audio-diag frames=${frames} rms=${rms.toFixed(4)} peak=${peak.toFixed(4)} `
         + `frames-total=${totalFrames} first-frame=${since(firstFrameAtMs)} `
         + `stt-chunks=${stt?.chunks ?? 0} stt-audio-sec=${(stt?.audioSec ?? 0).toFixed(1)} `
-        + `stt-pcm-bytes=${stt?.pcmBytes ?? 0} first-chunk=${since(stt?.firstChunkAtMs)}`;
+        + `stt-pcm-bytes=${stt?.pcmBytes ?? 0} first-chunk=${since(stt?.firstChunkAtMs)}`
+        + (lane ? ` ${lane}` : '');
       frames = 0; samples = 0; sumSq = 0; peak = 0;
       return out;
     },

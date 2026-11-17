@@ -120,11 +120,18 @@ export interface ChatSendReport {
 }
 
 /** One report for an acts.v1 `speak` that carried an `id` (transcript.v1 `SpeakResult`, on the same
- *  signed stream as the transcript): `speaking` once the mic is confirmed open and playback starts,
- *  then `spoken` with `duration_ms` (ms of audio played) or `failed` with the SpeakFailure reason. */
+ *  signed stream as the transcript): `speaking` once the mic is confirmed open and synthesis starts,
+ *  then `spoken` with `duration_ms` (ms of audio played) or `failed` with the SpeakFailure reason.
+ *  A `spoken` report also says where the line's time went, in ms from the moment the bot took the
+ *  act: `queue_ms` behind earlier lines, `mic_ms` on the meeting-UI mic, `first_audio_ms` to the
+ *  first PCM handed to the player, `synth_ms` of that waiting on the TTS service (0 when the first
+ *  sentence was cached), and `cached` when every sentence came from the clip cache. */
 export type SpeakReport =
   | { id: string; status: 'speaking' }
-  | { id: string; status: 'spoken'; duration_ms: number }
+  | {
+    id: string; status: 'spoken'; duration_ms: number;
+    queue_ms?: number; mic_ms?: number; first_audio_ms?: number; synth_ms?: number; cached?: boolean;
+  }
   | { id: string; status: 'failed'; reason: string };
 
 export interface TranscriptionProgressReport {

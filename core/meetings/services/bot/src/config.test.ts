@@ -10,7 +10,10 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseInvocation, loadInvocation, InvocationError, speakerStreamConfigFromEnv, sttTimeoutMsFromEnv, withLatencyProfile, reconfirmSecFromEnv } from './config.js';
+import {
+  parseInvocation, loadInvocation, InvocationError, speakerStreamConfigFromEnv, sttTimeoutMsFromEnv, withLatencyProfile, reconfirmSecFromEnv,
+  reconfirmQuietMsFromEnv, reconfirmIdleMsFromEnv, sttBiasFromEnv, DEFAULT_RECONFIRM_QUIET_MS, DEFAULT_RECONFIRM_IDLE_MS,
+} from './config.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const GOLDEN_DIR = join(HERE, '..', '..', '..', 'contracts', 'invocation.v1', 'golden');
@@ -134,6 +137,29 @@ console.log('\n✅ config (L1/L2): the goldens parse, the env helper round-trips
     meet?.pauseFinalMs === 500 && meet?.confirmThreshold === 1 && meet?.pipelineDrafts === true && meet?.maxBufferDuration === 12, JSON.stringify(meet));
   const note = withLatencyProfile('voice_note', undefined, { BOT_TRANSCRIPTION_LATENCY: 'low' });
   check('low on a voice note: pause finals without pipelined drafts', note?.pauseFinalMs === 700 && !note?.pipelineDrafts, JSON.stringify(note));
+}
+
+// ── end of turn and STT bias knobs: env-tunable, current behaviour when unset ──
+{
+  const none = () => {};
+  const paused = withLatencyProfile('google_meet', speakerStreamConfigFromEnv({ BOT_SPEAKER_PAUSE_FINAL_MS: '350' }, none), {});
+  check('BOT_SPEAKER_PAUSE_FINAL_MS overrides the profile pause (the rest of the profile stays)',
+    paused?.pauseFinalMs === 350 && paused?.pipelineDrafts === true && paused?.confirmThreshold === 1, JSON.stringify(paused));
+  check('unset: the profile pause of 500 ms', withLatencyProfile('google_meet', speakerStreamConfigFromEnv({}, none), {})?.pauseFinalMs === 500);
+  let warned = '';
+  check('an invalid pause is refused loudly and the default kept',
+    speakerStreamConfigFromEnv({ BOT_SPEAKER_PAUSE_FINAL_MS: 'soon' }, (m) => { warned = m; }) === undefined && /BOT_SPEAKER_PAUSE_FINAL_MS/.test(warned), warned);
+  check('reconfirm quiet / idle: defaults 1000 / 1500 when unset',
+    reconfirmQuietMsFromEnv({}) === 1000 && reconfirmIdleMsFromEnv({}) === 1500 && DEFAULT_RECONFIRM_QUIET_MS === 1000 && DEFAULT_RECONFIRM_IDLE_MS === 1500);
+  check('BOT_TRANSCRIPT_RECONFIRM_QUIET_MS / _IDLE_MS override them',
+    reconfirmQuietMsFromEnv({ BOT_TRANSCRIPT_RECONFIRM_QUIET_MS: '700' }) === 700 && reconfirmIdleMsFromEnv({ BOT_TRANSCRIPT_RECONFIRM_IDLE_MS: '1200' }) === 1200);
+  check('out of range or invalid: bounded, or the default',
+    reconfirmQuietMsFromEnv({ BOT_TRANSCRIPT_RECONFIRM_QUIET_MS: '50' }) === 1000 && reconfirmQuietMsFromEnv({ BOT_TRANSCRIPT_RECONFIRM_QUIET_MS: '999999' }) === 10_000
+      && reconfirmIdleMsFromEnv({ BOT_TRANSCRIPT_RECONFIRM_IDLE_MS: 'x' }) === 1500);
+  check('BOT_STT_HOTWORDS / BOT_STT_PROMPT: passed when set, absent when unset or blank',
+    JSON.stringify(sttBiasFromEnv({ BOT_STT_HOTWORDS: ' Betty, hive queue ', BOT_STT_PROMPT: 'A meeting about the hive.' }))
+      === JSON.stringify({ hotwords: 'Betty, hive queue', initialPrompt: 'A meeting about the hive.' })
+      && JSON.stringify(sttBiasFromEnv({ BOT_STT_HOTWORDS: '  ' })) === '{}' && JSON.stringify(sttBiasFromEnv({})) === '{}');
 }
 
 if (failed) { console.error(`\n❌ config env tuning: ${failed} check(s) FAILED.`); process.exit(1); }

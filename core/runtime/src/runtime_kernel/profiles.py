@@ -363,6 +363,14 @@ def default_registry() -> ProfileRegistry:
             "BOT_STT_CONFIDENCE_FILTER",
             "BOT_TRANSCRIPT_RECONFIRM_SEC",
             "BOT_TTS_PREWARM",
+            "BOT_TTS_PREWARM_VOICES",
+            "BOT_TTS_SYNTH_CONCURRENCY",
+            "BOT_STT_HOTWORDS",
+            "BOT_STT_PROMPT",
+            "BOT_SPEAKER_PAUSE_FINAL_MS",
+            "BOT_TRANSCRIPT_RECONFIRM_QUIET_MS",
+            "BOT_TRANSCRIPT_RECONFIRM_IDLE_MS",
+            "BOT_LEAVE_DRAIN_MS",
             # Google Meet knock policy (2 Nov 2026): Meet refuses a share of anonymous knocks at random;
             # how many knocks, the extra wait between them and the guest-state wipe are deployment
             # settings, so they change without a new bot image (core/meetings/modules/join refusal.ts).

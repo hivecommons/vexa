@@ -101,6 +101,23 @@ spec:
             # Short lines a voice bot synthesizes ahead of time ("|"-separated; values: runtime.ttsPrewarm).
             - name: BOT_TTS_PREWARM
               value: {{ .Values.runtime.ttsPrewarm | default "" | quote }}
+            # Voice and transcription tuning forwarded into each new meeting-bot Pod (values: runtime.*).
+            - name: BOT_TTS_PREWARM_VOICES
+              value: {{ .Values.runtime.ttsPrewarmVoices | default "" | quote }}
+            - name: BOT_TTS_SYNTH_CONCURRENCY
+              value: {{ .Values.runtime.ttsSynthConcurrency | default "" | quote }}
+            - name: BOT_STT_HOTWORDS
+              value: {{ .Values.runtime.sttHotwords | default "" | quote }}
+            - name: BOT_STT_PROMPT
+              value: {{ .Values.runtime.sttPrompt | default "" | quote }}
+            - name: BOT_SPEAKER_PAUSE_FINAL_MS
+              value: {{ .Values.runtime.speakerStream.pauseFinalMs | default "" | quote }}
+            - name: BOT_TRANSCRIPT_RECONFIRM_QUIET_MS
+              value: {{ .Values.runtime.speakerStream.reconfirmQuietMs | default "" | quote }}
+            - name: BOT_TRANSCRIPT_RECONFIRM_IDLE_MS
+              value: {{ .Values.runtime.speakerStream.reconfirmIdleMs | default "" | quote }}
+            - name: BOT_LEAVE_DRAIN_MS
+              value: {{ .Values.runtime.leaveDrainMs | default "" | quote }}
             # Google Meet knock policy, forwarded into each new meeting-bot Pod (values: runtime.googleMeetKnock).
             - name: VEXA_GOOGLE_JOIN_MAX_KNOCKS
               value: {{ .Values.runtime.googleMeetKnock.maxKnocks | default "" | quote }}

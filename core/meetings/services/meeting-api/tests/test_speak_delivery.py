@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime
 from pathlib import Path
 
 import fakeredis.aioredis
@@ -30,6 +31,7 @@ from meeting_api.collector import consume_segments
 from meeting_api.collector.fakes import FakeRedisBus, InMemoryTranscriptStore
 from meeting_api.speak_delivery import (
     SPEAK_SEND_TTL_SEC, SPEAK_UNCONFIRMED_AFTER_SEC, SpeakDeliveryLedger, speak_send_key,
+    speak_timeline, speak_timing,
 )
 
 from _segment_auth import admin_token, signed_xadd, token_for  # noqa: F401
@@ -165,6 +167,56 @@ def test_speaking_then_spoken_reads_the_duration(rig, redis, admin_token):
     body = _status(client, rid).json()
     STATUS.validate(body)
     assert body["status"] == "spoken" and body["duration_ms"] == 2340 and "reason" not in body
+
+
+def test_a_spoken_line_reads_when_and_where_its_time_went(rig, redis, admin_token):
+    """The status read carries the timeline (ISO 8601) and the bot's own measurements, so a caller
+    computes the time to first audio without guessing."""
+    client, repo, _ = rig
+    m = _seed(repo)
+    rid = _say(client)["request_id"]
+    queued = _status(client, rid).json()
+    assert queued["queued_at"].endswith("Z") and "speaking_at" not in queued and "first_audio_ms" not in queued
+    _bot_reports(redis, _report(m["id"], rid, "speaking"), token=token_for(m["id"]))
+    assert "speaking_at" in _status(client, rid).json()
+    spoken = _report(m["id"], rid, "spoken", duration_ms=1827, queue_ms=0, mic_ms=6,
+                     first_audio_ms=412, synth_ms=398, cached=False)
+    RESULT.validate(spoken)
+    _bot_reports(redis, spoken, token=token_for(m["id"]))
+    body = _status(client, rid).json()
+    STATUS.validate(body)
+    assert (body["first_audio_ms"], body["synth_ms"], body["queue_ms"], body["mic_ms"], body["cached"]) == (412, 398, 0, 6, False)
+    stamps = [datetime.fromisoformat(body[k].replace("Z", "+00:00"))
+              for k in ("queued_at", "speaking_at", "first_audio_at", "spoken_at")]
+    assert (stamps[2] - stamps[0]).total_seconds() == pytest.approx(0.412, abs=0.002)
+    assert stamps[0] <= stamps[1] <= stamps[3]
+
+
+def test_a_spoken_line_without_timing_reads_as_before(rig, redis, admin_token):
+    client, repo, _ = rig
+    m = _seed(repo)
+    rid = _say(client)["request_id"]
+    _bot_reports(redis, _report(m["id"], rid, "spoken", duration_ms=2340), token=token_for(m["id"]))
+    body = _status(client, rid).json()
+    assert body["status"] == "spoken" and body["duration_ms"] == 2340 and "spoken_at" in body
+    assert not {"first_audio_ms", "synth_ms", "cached", "first_audio_at"} & set(body)
+
+
+def test_malformed_timing_is_dropped_field_by_field():
+    assert speak_timing({"first_audio_ms": 412, "synth_ms": -1, "queue_ms": "3", "mic_ms": True,
+                         "cached": "yes", "other": 1}) == {"first_audio_ms": 412}
+    assert speak_timing({"first_audio_ms": 10 ** 9, "cached": True}) == {"cached": True}
+    assert speak_timing(None) == {}
+
+    async def run():
+        ledger = SpeakDeliveryLedger()
+        await ledger.record("abc", user_id=1, meeting_id=1, platform="teams", native_meeting_id="x")
+        assert await ledger.settle("abc", meeting_id=1, status="spoken", duration_ms=5,
+                                   timing={"first_audio_ms": 7, "synth_ms": 0, "cached": True, "junk": []})
+        return await ledger.read("abc")
+    record = asyncio.run(run())
+    assert record["timing"] == {"first_audio_ms": 7, "synth_ms": 0, "cached": True}
+    assert speak_timeline(record)["first_audio_ms"] == 7
 
 
 def test_mic_muted_reads_failed_with_the_reason(rig, redis, admin_token):

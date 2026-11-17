@@ -67,10 +67,31 @@ export interface OrchestratorDeps {
    *  Consulted on a failed join (not admitted, or the join threw) before the terminal report.
    *  MUST NOT throw and must settle quickly — it delays the terminal by at most its own bound. */
   failureScreenshot?: () => Promise<string | undefined>;
+  /** What the bot is still saying or posting (the speak queue, a chat send in progress). On a
+   *  `stopped` end the platform leave waits for it, at most `leaveDrainMs`, so a last "Leaving
+   *  now." is heard or posted instead of cut off by the leave. MUST NOT throw. */
+  beforeLeave?: () => Promise<void>;
+  /** The most the leave waits on `beforeLeave` (ms). Default LEAVE_DRAIN_MS; 0 = no wait. */
+  leaveDrainMs?: number;
   /** Producer clock for lifecycle facts. Injected by tests; each logical event is stamped once
    *  before the lifecycle adapter performs any HTTP retry. */
   now?: () => string;
 }
+
+/** How long a `stopped` leave waits for the speak queue and a chat send in progress. Inside the
+ *  stop budget: with the 8 s leave bound after it, well under the force-exit watchdog. */
+export const LEAVE_DRAIN_MS = 4000;
+/** A wait at least this long is logged. */
+const LEAVE_DRAIN_LOG_MS = 100;
+
+/** `BOT_LEAVE_DRAIN_MS`: the leave's wait for a last line or chat send (0..8000 ms; unset or
+ *  invalid = LEAVE_DRAIN_MS). */
+export function leaveDrainMsFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = (env.BOT_LEAVE_DRAIN_MS ?? '').trim();
+  const v = Number(raw);
+  return raw !== '' && Number.isFinite(v) && v >= 0 ? Math.min(v, LEAVE_DRAIN_MAX_MS) : LEAVE_DRAIN_MS;
+}
+const LEAVE_DRAIN_MAX_MS = 8000;
 
 /** The dedicated non-zero exit code for a pre-join control-plane-unreachable abort (#530). On
  *  k8s each bot is a bare Pod (`--restart=Never`, `k8s_backend.py`) — the terminal exit code IS
@@ -432,6 +453,21 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
     stopRemoval();
     await deps.pipeline.stop().catch(() => { /* best-effort */ });
     deps.recording?.close(recordingKey);
+    // A stop asked for while the bot is mid-sentence or mid-post lets that finish first: lines keep
+    // playing while the pipeline stops above, so this is only what is left of them, and bounded.
+    const drainMs = deps.leaveDrainMs ?? LEAVE_DRAIN_MS;
+    if (reason === 'stopped' && deps.beforeLeave && drainMs > 0) {
+      const drainStarted = Date.now();
+      let drainTimer: ReturnType<typeof setTimeout> | undefined;
+      const drained = await Promise.race([
+        deps.beforeLeave().then(() => true, () => true),
+        new Promise<boolean>((resolve) => { drainTimer = setTimeout(() => resolve(false), drainMs); }),
+      ]);
+      if (drainTimer) clearTimeout(drainTimer);
+      const waited = Date.now() - drainStarted;
+      if (!drained) console.error(`[bot] orchestrator: leaving with a line or chat send still in progress after ${waited} ms`);
+      else if (waited >= LEAVE_DRAIN_LOG_MS) console.error(`[bot] orchestrator: waited ${waited} ms for the last line or chat send before leaving`);
+    }
     // Bound the leave: a hung platform leave (e.g. a slow Zoom web-client teardown) must not stall
     // the disposable worker past its SIGKILL grace — that would cut off the recording-master
     // assembly + the `completed` callback flush. Best-effort, raced against an 8s cap.

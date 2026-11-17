@@ -753,9 +753,30 @@ runtime:
     confidenceFilter: ""
     # Show fast, then reconfirm (BOT_TRANSCRIPT_RECONFIRM_SEC): "" = 10 s; "0" = off.
     reconfirmSec: ""
+    # BOT_SPEAKER_PAUSE_FINAL_MS: quiet (ms) after speech that ends an utterance. "" = 500.
+    pauseFinalMs: ""
+    # BOT_TRANSCRIPT_RECONFIRM_QUIET_MS: quiet (ms) since a speaker's last speech after which their
+    # drafts are confirmed (the end of turn a consumer of completed segments sees). "" = 1000.
+    reconfirmQuietMs: ""
+    # BOT_TRANSCRIPT_RECONFIRM_IDLE_MS: time (ms) after a speaker's last draft after which their
+    # drafts are confirmed while speech goes on. "" = 1500.
+    reconfirmIdleMs: ""
   # BOT_TTS_PREWARM: short lines a voice bot synthesizes ahead of time for each voice it speaks with,
   # "|"-separated (e.g. an agent's stock acknowledgements), so they play at once. "" = none.
   ttsPrewarm: ""
+  # BOT_TTS_PREWARM_VOICES: voices the prewarm lines are synthesized for when the bot starts,
+  # ","-separated (the voices its agent speaks with). "" = the default voice only.
+  ttsPrewarmVoices: ""
+  # BOT_TTS_SYNTH_CONCURRENCY: sentences of one spoken line synthesized at once, 1..8. "" = 2.
+  ttsSynthConcurrency: ""
+  # BOT_STT_HOTWORDS: names and domain words sent as hotwords with every bot transcription request
+  # (e.g. "Betty, hive queue, pull request"). "" = none.
+  sttHotwords: ""
+  # BOT_STT_PROMPT: a fixed opening for the prompt of every bot transcription request. "" = none.
+  sttPrompt: ""
+  # BOT_LEAVE_DRAIN_MS: how long a stopped bot waits (ms, 0..8000) for the line it is speaking and
+  # a chat send in progress before it leaves. "" = 4000.
+  leaveDrainMs: ""
   # Active-phase remote-audio silence window. Empty uses the bot's 10-minute default.
   aloneSilenceWindowMs: ""
   # Google Meet refuses some anonymous knocks at random; the bot knocks again on the same page.

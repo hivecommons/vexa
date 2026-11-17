@@ -1104,9 +1104,11 @@ class FakeRedisBus:
         return await ChatDeliveryLedger(self._client).settle(
             request_id, meeting_id=meeting_id, posted=posted, reason=reason)
 
-    async def settle_speak(self, request_id, *, meeting_id, status, duration_ms=None, reason=None):
+    async def settle_speak(self, request_id, *, meeting_id, status, duration_ms=None, reason=None,
+                           timing=None):
         """``RedisBus.settle_speak`` over the wrapped fakeredis client."""
         from ..speak_delivery import SpeakDeliveryLedger
 
         return await SpeakDeliveryLedger(self._client).settle(
-            request_id, meeting_id=meeting_id, status=status, duration_ms=duration_ms, reason=reason)
+            request_id, meeting_id=meeting_id, status=status, duration_ms=duration_ms, reason=reason,
+            timing=timing)

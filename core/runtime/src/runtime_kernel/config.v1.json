@@ -496,6 +496,94 @@
       ]
     },
     {
+      "key": "BOT_TTS_PREWARM_VOICES",
+      "class": "defaulted",
+      "default": "(unset: the default voice only)",
+      "description": "voices a voice bot prewarms its BOT_TTS_PREWARM lines for as soon as it can speak, comma-separated (the voices its agent speaks with); the default voice is always included; forwarded to spawned bots",
+      "targets": [
+        "compose",
+        "helm",
+        "lite"
+      ]
+    },
+    {
+      "key": "BOT_TTS_SYNTH_CONCURRENCY",
+      "class": "defaulted",
+      "default": "(unset: bot default 2)",
+      "description": "sentences of one spoken line a voice bot has in synthesis at once (1-8): the first sentence plays while the next ones are synthesized; forwarded to spawned bots",
+      "targets": [
+        "compose",
+        "helm",
+        "lite"
+      ]
+    },
+    {
+      "key": "BOT_STT_HOTWORDS",
+      "class": "defaulted",
+      "default": "(unset: none)",
+      "description": "names and domain words sent as hotwords with every transcription request of a spawned bot, so the model prefers them when it hears something close; forwarded to spawned bots",
+      "targets": [
+        "compose",
+        "helm",
+        "lite"
+      ]
+    },
+    {
+      "key": "BOT_STT_PROMPT",
+      "class": "defaulted",
+      "default": "(unset: none)",
+      "description": "a fixed opening for the prompt of every transcription request of a spawned bot (the lane's rolling context follows it); forwarded to spawned bots",
+      "targets": [
+        "compose",
+        "helm",
+        "lite"
+      ]
+    },
+    {
+      "key": "BOT_SPEAKER_PAUSE_FINAL_MS",
+      "class": "defaulted",
+      "default": "(unset: profile default 500)",
+      "description": "quiet in milliseconds after speech that ends an utterance and sends it as a final window; forwarded to spawned bots",
+      "targets": [
+        "compose",
+        "helm",
+        "lite"
+      ]
+    },
+    {
+      "key": "BOT_TRANSCRIPT_RECONFIRM_QUIET_MS",
+      "class": "defaulted",
+      "default": "(unset: bot default 1000)",
+      "description": "quiet in milliseconds since a speaker's last speech after which their drafts are replaced by the confirmed segment: what a consumer of completed segments experiences as the end of turn; forwarded to spawned bots",
+      "targets": [
+        "compose",
+        "helm",
+        "lite"
+      ]
+    },
+    {
+      "key": "BOT_TRANSCRIPT_RECONFIRM_IDLE_MS",
+      "class": "defaulted",
+      "default": "(unset: bot default 1500)",
+      "description": "milliseconds after a speaker's last draft after which their drafts are confirmed while speech goes on; forwarded to spawned bots",
+      "targets": [
+        "compose",
+        "helm",
+        "lite"
+      ]
+    },
+    {
+      "key": "BOT_LEAVE_DRAIN_MS",
+      "class": "defaulted",
+      "default": "(unset: bot default 4000)",
+      "description": "how long a stopped bot waits, in milliseconds (0-8000), for the line it is speaking and a chat send in progress before it leaves the meeting; forwarded to spawned bots",
+      "targets": [
+        "compose",
+        "helm",
+        "lite"
+      ]
+    },
+    {
       "key": "VEXA_GOOGLE_JOIN_MAX_KNOCKS",
       "class": "defaulted",
       "default": "(unset \u2014 bot default 10)",

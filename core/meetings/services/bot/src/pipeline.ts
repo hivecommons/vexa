@@ -39,7 +39,10 @@ import {
   type TurnSourceObservation,
 } from '@vexa/mixed-pipeline';
 import { TranscriptionClient, confidenceFilterFromEnv, type SttPressure, type TranscriptionResult } from '@vexa/transcribe-whisper';
-import { isMixedLanePlatform, isPerTrackLanePlatform, reconfirmSecFromEnv, sttTimeoutMsFromEnv, type Invocation, type Platform } from './config.js';
+import {
+  isMixedLanePlatform, isPerTrackLanePlatform, reconfirmIdleMsFromEnv, reconfirmQuietMsFromEnv, reconfirmSecFromEnv, sttBiasFromEnv,
+  sttTimeoutMsFromEnv, type Invocation, type Platform,
+} from './config.js';
 import type { TranscriptSegment } from './contracts.js';
 import type { Pipeline, TranscriptSink } from './ports.js';
 import {
@@ -119,7 +122,7 @@ export type TeamsTranscriber = Pick<
   | 'recordRosterName'
   | 'recordRosterCoverage'
   | 'dispose'
-> & Partial<Pick<TeamsCsrcGmeetPipeline, 'missingRanges'>>;
+> & Partial<Pick<TeamsCsrcGmeetPipeline, 'missingRanges' | 'health'>>;
 export type TeamsTranscriberFactory = (options: TeamsCsrcGmeetPipelineOptions) => TeamsTranscriber;
 
 /** The Pipeline port extended with the capture entry the bridge pumps frames into. The
@@ -148,6 +151,9 @@ export interface BotPipeline extends Pipeline {
   /** How much of the roster the producer could read (seen vs named) — the completeness premise
    *  the namer's elimination rule depends on. */
   recordRosterCoverage?(named: number, participants: number, tMs?: number): void;
+  /** The lane's own state for the periodic audio-diag line (what was routed, published, refused),
+   *  as `key=value` pairs. Absent on lanes that do not report one. */
+  laneDiag?(): string;
   /** Mixed lane only: the cumulative hint-hop counters (undefined on the gmeet lane). */
   readonly hintCounters?: HintCounters;
   /** Teams lane: what crossed to STT (chunks, audio seconds, bytes, first-chunk time). */
@@ -295,6 +301,7 @@ function createGmeetBotPipeline(
   onsetGapMs?: number,
   stopBudgetMs: number = STOP_TRANSCRIBE_BUDGET_MS,
   reconfirmSec = 0,
+  reconfirmWait: { quietMs?: number; idleMs?: number } = {},
 ): BotPipeline {
   // Progress → the meeting's feed: a viewer sees "catching up (Ns behind)" while transcription is
   // behind capture, and "finishing" while the final pass runs after stop.
@@ -305,6 +312,7 @@ function createGmeetBotPipeline(
   };
   const lane = createGmeetPipeline({
     transcribe, sink: laneSink(sink, onError), config, onError, onsetGapMs, reconfirmSec,
+    reconfirmQuietMs: reconfirmWait.quietMs, reconfirmIdleMs: reconfirmWait.idleMs,
     // Under overload a reconfirmation waits; it must still end inside the stop budget.
     reconfirmHoldMs: Math.min(15_000, Math.max(1_000, stopBudgetMs - 10_000)),
     // The final pass ends inside the stop budget, so the terminal report goes out with what is left.
@@ -382,6 +390,9 @@ export function teamsLaneBufferConfig(
   };
 }
 
+/** Shared-window log lines the Teams lane prints: each explains a pass that produced no row. */
+const TEAMS_LANE_LOG_MARKERS = ['[FILTERED]', '[SILENT-SKIP]', '[STT-FAULT]'];
+
 /** Build the Teams-only CSRC virtual-channel lane. The shared GMeet-compatible buffer owns
  * cadence, prompt feedback, LocalAgreement and terminal fallback. This adapter owns only the bot
  * ports: mixed PCM/identity evidence in, transcript.v1 publish/retract out. */
@@ -399,10 +410,16 @@ function createTeamsBotPipeline(
   const sttCounters: SttCounters = { chunks: 0, audioSec: 0, pcmBytes: 0 };
   const counted = countingTranscribe(transcribe, sttCounters);
   const reportError = onError ?? ((error: unknown) => console.error(`[bot] pipeline(teams-csrc): ${String(error)}`));
+  const rows = { drafts: 0, finals: 0, retracts: 0 };
+  // The shared window says why a result never became a row (filtered text, a silent window, an
+  // STT fault); those lines are the only trace of a pass that published nothing.
+  const laneLog = (message: string): void => {
+    if (TEAMS_LANE_LOG_MARKERS.some((marker) => message.includes(marker))) console.log(`[bot] pipeline(teams-csrc): ${message}`);
+  };
 
   const transcriber = createTranscriber({
     transcribe: (pcm, prompt) => counted(pcm, prompt),
-    buffer,
+    buffer: { ...buffer, logger: buffer?.logger ?? laneLog },
     onNoTransportFallback: (event) => {
       console.log(event.engaged
         ? `[bot] pipeline(teams-csrc): no CSRC edge after ${Math.round(event.waitedMs)}ms of capture — transcribing the mix on the fallback lane`
@@ -413,12 +430,24 @@ function createTeamsBotPipeline(
     finalPassMs: Math.max(0, stopBudgetMs - 5_000),
     selfName,
     onSegment: (segment) => {
+      if (!segment.text.trim()) rows.retracts++;
+      else if (segment.completed) rows.finals++;
+      else rows.drafts++;
       const task = !segment.completed && !segment.text.trim()
         ? sink.retract?.([segment.segmentId])
         : sink.publish(teamsToBotSegment(segment));
       void task?.catch(reportError);
     },
+    onUncontestedOwnership: (segment, offsetMs, intervals) => {
+      console.warn(`[bot] pipeline(teams-csrc): final row ${Math.round(segment.startMs)}-${Math.round(segment.endMs)} lies outside CSRC ${segment.csrc}'s interval `
+        + `(capture clock ${Math.round(offsetMs)}ms before the transport clock); published, no other lane had that audio`);
+      try {
+        onObservation?.('teams-csrc-ownership-uncontested', { segment, offsetMs, intervals }, segment.endMs);
+      } catch { /* diagnostics never break the transcript lane */ }
+    },
     onRejectedOwnership: (segment, intervals) => {
+      console.warn(`[bot] pipeline(teams-csrc): final row ${Math.round(segment.startMs)}-${Math.round(segment.endMs)} REFUSED: outside CSRC ${segment.csrc}'s interval `
+        + `and another lane had that audio (${segment.text.length} chars dropped)`);
       try {
         onObservation?.('teams-csrc-ownership-rejected', { segment, intervals }, segment.endMs);
       } catch { /* diagnostics never break the transcript lane */ }
@@ -441,6 +470,12 @@ function createTeamsBotPipeline(
     recordRosterCoverage: (named, participants, tMs) => transcriber.recordRosterCoverage(named, participants, tMs),
     hintCounters,
     sttCounters,
+    laneDiag: () => {
+      const h = transcriber.health?.();
+      return `lane-frames-in=${h?.inputFrames ?? 0} lane-frames-routed=${h?.emittedFrames ?? 0} csrc-active=${h?.active ?? 0} `
+        + `turns=${h?.turns ?? 0} drafts=${rows.drafts} finals=${rows.finals} retracts=${rows.retracts} `
+        + `refused-ownership=${h?.rejectedOwnership ?? 0} clock-offset-finals=${h?.uncontestedOwnership ?? 0}`;
+    },
     missingRanges: () => transcriber.missingRanges?.() ?? [],
   };
 }
@@ -584,6 +619,8 @@ export function createTranscribe(
     requestTimeoutMs: sttTimeoutMsFromEnv(env),
     // BOT_STT_CONFIDENCE_FILTER=strict (forwarded by the runtime); unset → the always-on rule only.
     confidenceFilter: confidenceFilterFromEnv(env.BOT_STT_CONFIDENCE_FILTER),
+    // BOT_STT_HOTWORDS / BOT_STT_PROMPT (forwarded by the runtime): sent with every request.
+    ...sttBiasFromEnv(env),
   });
   const transcribe: Transcribe & { sttPressure?: SttPressure } =
     languageAwareTranscribe((pcm, language, prompt) => client.transcribe(pcm, language, prompt), control);
@@ -654,6 +691,8 @@ export function createBotPipeline(
   return createGmeetBotPipeline(
     transcribe, sink, perChannelLaneConfig(inv.platform, opts.config), opts.onError, perChannelOnsetGapMs(inv.platform),
     stopBudgetMs, opts.reconfirmSec ?? reconfirmSecFromEnv(),
+    // BOT_TRANSCRIPT_RECONFIRM_QUIET_MS / _IDLE_MS (forwarded by the runtime); unset → 1000 / 1500.
+    { quietMs: reconfirmQuietMsFromEnv(), idleMs: reconfirmIdleMsFromEnv() },
   );
 }
 

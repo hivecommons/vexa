@@ -9,23 +9,36 @@
  * Google Meet renders each participant's audio as a separate <audio>/<video>
  * element whose srcObject is a live MediaStream. This wires each into a
  * dedicated AudioContext → AudioWorklet, resampled to 16 kHz, and delivers
- * per-element PCM chunks via onAudio(index, pcm). It rescans for late joiners /
- * recycled elements and silence-gates each chunk. The track index is stable per
- * stream id (the basis for per-track speaker attribution in gmeet-speakers.ts).
+ * per-element PCM chunks via onAudio(index, pcm, meta). It rescans for late joiners /
+ * recycled elements and silence-gates each stream with room around speech (speech-window.ts: the
+ * block before a stretch of speech and the blocks after it are delivered too, so a clip never
+ * starts or ends inside a word). The track index is stable per stream id (the basis for per-track
+ * speaker attribution in gmeet-speakers.ts).
  */
 
 import { createPcmCaptureNode } from './pcm-capture.js';
+import { blockPeak, createSpeechWindow } from './speech-window.js';
 
 export interface GmeetCaptureOptions {
-  /** One per-element PCM chunk (already 16 kHz). index is the stable track index. */
-  onAudio: (index: number, pcm: Float32Array) => void;
+  /** One per-element PCM chunk (already 16 kHz). index is the stable track index. `meta.tsMs` is
+   *  when the chunk was captured (a pre-roll chunk is delivered after the fact, so it is not "now");
+   *  `meta.voiced` is false for the quiet chunks kept around speech. */
+  onAudio: (index: number, pcm: Float32Array, meta: GmeetAudioMeta) => void;
   log?: (msg: string) => void;
   targetSampleRate?: number;   // default 16000
   bufferSize?: number;         // default 4096
-  silenceThreshold?: number;   // default 0.005 — skip near-silent chunks
+  silenceThreshold?: number;   // default 0.005: a chunk whose peak is above it is speech
+  preRollBlocks?: number;      // default 1: quiet chunks kept before a stretch of speech
+  postRollBlocks?: number;     // default 2: quiet chunks kept after it
+  now?: () => number;          // capture clock (default Date.now)
   rescanMs?: number;           // default 15000 — discover late joiners
   findRetries?: number;        // default 10
   findDelayMs?: number;        // default 2000
+}
+
+export interface GmeetAudioMeta {
+  tsMs: number;
+  voiced: boolean;
 }
 
 export interface GmeetCapture {
@@ -42,6 +55,7 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
   const RESCAN = opts.rescanMs ?? 15000;
   const FIND_RETRIES = opts.findRetries ?? 10;
   const FIND_DELAY = opts.findDelayMs ?? 2000;
+  const now = opts.now ?? (() => Date.now());
 
   let running = false;
   let rescanTimer: ReturnType<typeof setInterval> | null = null;
@@ -73,13 +87,17 @@ export function createGmeetCapture(opts: GmeetCaptureOptions): GmeetCapture {
       // which duplicates/drops buffers under main-thread load — the captured-audio
       // stutter. connectElement is sync, so wire the node when addModule resolves.
       let seen = 0, emitted = 0; // L4 frame-flow diagnostic
+      const gate = createSpeechWindow({ threshold: SILENCE, preRollBlocks: opts.preRollBlocks, postRollBlocks: opts.postRollBlocks });
       createPcmCaptureNode(ctx, (data) => {
         if (!running) return;
         seen++;
-        let maxVal = 0;
-        for (let i = 0; i < data.length; i++) { const a = Math.abs(data[i]); if (a > maxVal) maxVal = a; }
-        if (maxVal > SILENCE) { emitted++; if (emitted === 1 || emitted % 100 === 0) log(`stream ${index} AUDIO seen=${seen} emitted=${emitted} max=${maxVal.toFixed(3)}`); opts.onAudio(index, data); } // worklet already yields a fresh copy
-        else if (seen % 250 === 0) log(`stream ${index} silent seen=${seen} emitted=${emitted} max=${maxVal.toFixed(4)} ctx=${ctx.state}`);
+        const out = gate.push(data, now());        // worklet already yields a fresh copy
+        for (const block of out) {
+          emitted++;
+          if (block.voiced && (emitted === 1 || emitted % 100 === 0)) log(`stream ${index} AUDIO seen=${seen} emitted=${emitted} max=${blockPeak(block.pcm).toFixed(3)}`);
+          opts.onAudio(index, block.pcm, { tsMs: block.tsMs, voiced: block.voiced });
+        }
+        if (!out.length && seen % 250 === 0) log(`stream ${index} silent seen=${seen} emitted=${emitted} max=${blockPeak(data).toFixed(4)} ctx=${ctx.state}`);
       }).then((node) => { source.connect(node); node.connect(ctx.destination); })
         .catch((err: any) => console.log(`[gmeet-capture] worklet init failed: ${err?.message}`));
       connectedStreamIds.add(streamId);

@@ -90,6 +90,22 @@ export interface TranscriptionClientConfig {
   /** 'strict' also drops segments Whisper decoded with a low average log-probability (see
    *  confidence.ts for the measured rule); 'off' keeps only the always-on rule. Default 'off'. */
   confidenceFilter?: ConfidenceFilterMode;
+  /** Names and domain words the model should prefer when it hears something close ("Betty",
+   *  "hive queue"), sent as the `hotwords` form part of every request. A backend without the field
+   *  ignores it. Default: none. */
+  hotwords?: string;
+  /** A fixed opening for the `prompt` form part of every request (a sentence in the meeting's
+   *  vocabulary and style); the per-request context a lane passes follows it. Default: none. */
+  initialPrompt?: string;
+}
+
+/** The longest `hotwords` / `initialPrompt` sent (characters): the model reads a few hundred
+ *  tokens of context at most, and the rolling context needs its share. */
+export const STT_BIAS_MAX_CHARS = 600;
+
+/** One line, bounded: a value from configuration can never add a form part or outgrow the context. */
+export function sttBiasText(raw: string | undefined): string {
+  return (raw ?? '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, STT_BIAS_MAX_CHARS);
 }
 
 /** Segment audio RMS below which the STT's text for it is treated as invented over silence. */
@@ -188,6 +204,8 @@ export class TranscriptionClient {
   private resolveHost: Resolver | undefined;
   private responseFormat: 'verbose_json' | 'json' = 'verbose_json';
   private confidenceFilter: ConfidenceFilterMode;
+  private hotwords: string;
+  private initialPrompt: string;
   private gate: SttGate;
   constructor(config: TranscriptionClientConfig) {
     // Ensure serviceUrl ends with the transcriptions endpoint
@@ -208,6 +226,8 @@ export class TranscriptionClient {
     this.minSilenceDurationMs = config.minSilenceDurationMs;
     this.model = config.model ?? 'whisper-1';
     this.confidenceFilter = config.confidenceFilter ?? 'off';
+    this.hotwords = sttBiasText(config.hotwords);
+    this.initialPrompt = sttBiasText(config.initialPrompt);
     this.publicOnly = config.publicOnly ?? false;
     this.resolveHost = config.resolveHost;
     this.gate = config.gate ?? new SttGate({
@@ -445,12 +465,23 @@ export class TranscriptionClient {
       ));
     }
 
-    // Prompt: previous confirmed text as context for streaming continuity
-    if (prompt) {
+    // Prompt: the configured opening (if any), then the previous confirmed text as context for
+    // streaming continuity.
+    const fullPrompt = [this.initialPrompt, prompt].filter(Boolean).join(' ');
+    if (fullPrompt) {
       parts.push(Buffer.from(
         `--${boundary}\r\n` +
         `Content-Disposition: form-data; name="prompt"\r\n\r\n` +
-        `${prompt}\r\n`
+        `${fullPrompt}\r\n`
+      ));
+    }
+
+    // Hotwords: names and domain words the model should prefer.
+    if (this.hotwords) {
+      parts.push(Buffer.from(
+        `--${boundary}\r\n` +
+        `Content-Disposition: form-data; name="hotwords"\r\n\r\n` +
+        `${this.hotwords}\r\n`
       ));
     }
 
