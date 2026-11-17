@@ -194,6 +194,41 @@ check('WRITE: an unlanded send logs chat_send_failed with its reason and never "
   botLog.filter((l) => l.includes('chat_send_failed reason=not_landed')).length === 2 && !botLog.some((l) => l.includes('chat_send: sent')),
   JSON.stringify(botLog));
 
+// 2d. The composer vanishes between the lookup and the input (the panel re-rendered and dropped the
+// mark): the trusted path looks it up once more and the second attempt puts the line out.
+{
+  const ops: string[] = [];
+  let vanishOnce = true;
+  const vanishingPage = {
+    ...(page as object),
+    locator(sel: string) {
+      const target = () => root.querySelector(sel);
+      const handle = {
+        async fill(t: string) {
+          ops.push(`fill ${sel}`);
+          if (vanishOnce) { vanishOnce = false; target()?.removeAttribute('data-vexa-chat-composer'); throw new Error('element is not attached to the DOM'); }
+          const el = target(); if (!el) throw new Error(`no ${sel}`); el.value = t;
+        },
+        async isEnabled() { return !!target(); },
+        async click() { ops.push(`click ${sel}`); const el = target(); if (!el) throw new Error(`no ${sel}`); el.click(); },
+        async press(k: string) { ops.push(`press ${k}`); },
+      };
+      return { first: () => handle, count: async () => root.querySelectorAll(sel).length };
+    },
+  } as never;
+  botLog.length = 0;
+  capture(true);
+  const r = await createChatSender(vanishingPage, inv('google_meet'), { landWaitMs: 200 }).send('after a re-render');
+  capture(false);
+  check('WRITE (trusted): a composer that vanished is looked up again and the line lands on attempt 2',
+    r.sent && r.via.includes('attempt 2') && composer.value === 'after a re-render'
+      && JSON.stringify(ops) === JSON.stringify(['fill [data-vexa-chat-composer]', 'fill [data-vexa-chat-composer]', 'click [data-vexa-chat-send]']),
+    `r=${JSON.stringify(r)} ops=${JSON.stringify(ops)}`);
+  check('WRITE (trusted): the retry is logged with its attempt count',
+    botLog.some((l) => l.includes('composer vanished before the line went out (attempt 1/2)')), JSON.stringify(botLog));
+  mutate(); tick();
+}
+
 // 3. jitsi + unsupported platforms
 const jitsiSent: string[] = [];
 g.APP = { conference: { _room: { sendTextMessage: (t: string) => jitsiSent.push(t) } } };

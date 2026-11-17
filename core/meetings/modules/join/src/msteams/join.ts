@@ -210,6 +210,14 @@ async function assertTeamsJoinNowEnabled(page: Page, joinNowButton: any, botName
   throw err;
 }
 
+/** How long Step 2 blocks on the "Continue on this browser" interstitial. Short on purpose: the
+ *  pre-join readiness loop (Step 2.5) also clicks that button whenever it shows, so a longer block
+ *  only delays every join that never gets the interstitial (most of them). */
+const TEAMS_CONTINUE_BUTTON_WAIT_MS = 2000;
+/** How long Step 3 looks for "Turn off camera". It runs after the pre-join controls are ready, so
+ *  the button is either rendered already or absent (camera already off, or no camera device). */
+const TEAMS_CAMERA_BUTTON_WAIT_MS = 1000;
+
 export async function joinMicrosoftTeams(
   page: Page,
   meetingUrl: string,
@@ -238,7 +246,7 @@ export async function joinMicrosoftTeams(
   log("Step 2: Looking for 'Continue on this browser' button...");
   try {
     const continueButton = page.locator(teamsContinueButtonSelectors[0]).first();
-    await continueButton.waitFor({ timeout: 10000 });
+    await continueButton.waitFor({ timeout: TEAMS_CONTINUE_BUTTON_WAIT_MS });
     await continueButton.click();
     log("✅ Clicked 'Continue on this browser' button");
     // Brief wait before pre-join readiness loop takes over
@@ -258,7 +266,7 @@ export async function joinMicrosoftTeams(
   // Turn camera off to be unobtrusive
   try {
     const cameraButton = page.locator(teamsCameraButtonSelectors[0]);
-    await cameraButton.waitFor({ timeout: 5000 });
+    await cameraButton.waitFor({ timeout: TEAMS_CAMERA_BUTTON_WAIT_MS });
     await cameraButton.click();
     log("✅ Camera turned off");
   } catch (error) {

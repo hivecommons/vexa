@@ -231,5 +231,42 @@ const logFn = (m: string) => log.push(m);
   check('landed: true once it shows', await awaitTeamsChatLanded('trusted line', p.before, 30));
 }
 
+// 10. Right after admission: no control bar yet. The toggle mounts late (a guest bar with no id,
+//     only its label), the wait keeps polling, opens the panel once it shows, and the send lands.
+{
+  const f = fixture({ open: false });
+  f.toggle.parentElement!.kids = [];
+  const guestToggle = new FakeEl('button', { 'aria-label': 'Chat' });
+  guestToggle.onclick = () => { if (!f.panel.parentElement) doc.root.append(f.panel); };
+  const LATE_TOGGLE_MS = 150;
+  setTimeout(() => doc.root.append(new FakeEl('div', { role: 'toolbar' }, [guestToggle])), LATE_TOGGLE_MS);
+  const lines: string[] = [];
+  const r = await sendTeamsChatMessage('consent notice', { log: (m) => lines.push(m), waitMs: 2000, landWaitMs: 50 });
+  check('late toggle: the wait outlasts a control bar that mounts after the send started', r.ok === true, JSON.stringify(r));
+  check('late toggle: the guest (label-only) toggle is clicked exactly once', guestToggle.clicks === 1, String(guestToggle.clicks));
+  check('late toggle: the wait logs how long the composer took', lines.some((l) => /composer ready after \d+ ms/.test(l)), JSON.stringify(lines));
+}
+
+// 11. A composer that never comes is no_composer only after the bounded wait, naming what it saw.
+{
+  fixture({ open: false, pressed: true });
+  const lines: string[] = [];
+  const WAIT_MS = 200;
+  const t0 = Date.now();
+  const r = await sendTeamsChatMessage('never', { log: (m) => lines.push(m), waitMs: WAIT_MS, landWaitMs: 50 });
+  check('bounded wait: no_composer', !r.ok && r.reason === 'no_composer', JSON.stringify(r));
+  check('bounded wait: it waited the budget before giving up', Date.now() - t0 >= WAIT_MS, String(Date.now() - t0));
+  check('bounded wait: the failure log names the toggle it saw', lines.some((l) => /no composer after \d+ ms \(toggle via #chat-button/.test(l)), JSON.stringify(lines));
+}
+
+// 12. prepare (the trusted path) waits for a late composer the same way.
+{
+  const f = fixture({ open: false });
+  f.toggle.onclick = () => { setTimeout(() => { if (!f.panel.parentElement) doc.root.append(f.panel); }, 120); };
+  const p = await prepareTeamsChatSend('slow panel', { waitMs: 2000 });
+  check('prepare: a panel that mounts slowly after the click still yields the composer', p.composer !== null, JSON.stringify(p));
+  check('prepare: the toggle was clicked once', f.toggle.clicks === 1, String(f.toggle.clicks));
+}
+
 console.log(failed ? `\n❌ ${failed} check(s) failed` : '\n✅ teams-chat-send: all checks passed');
 process.exit(failed ? 1 : 0);

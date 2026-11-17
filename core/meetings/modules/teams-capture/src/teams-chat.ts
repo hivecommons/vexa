@@ -220,12 +220,18 @@ export const teamsChatToggleSelectors: string[] = [
   '[data-tid="chat-button"]',
   'button[data-inp="chat-button"]',
   '[data-tid="toggle-chat"]',
+  // Guest / anonymous (light-meetings) control bars carry no stable id: match the button's label.
+  'button[aria-label="Chat" i]',
+  'button[aria-label^="Show conversation" i]',
+  'button[aria-label^="Open chat" i]',
 ];
 
 /** The chat composer: Teams' editor, most-specific first. Only shown, editable fields count. */
 export const teamsChatComposerSelectors: string[] = [
   '[data-tid="ckeditor"][contenteditable="true"]',
   '[data-tid="ckeditor-replyConversation"][contenteditable="true"]',
+  // Other editor variants (guest join, new compose box) keep the ckeditor prefix.
+  '[data-tid^="ckeditor"][contenteditable="true"]',
   'div[contenteditable="true"][role="textbox"]',
   '[contenteditable="true"][aria-label*="message" i]',
 ];
@@ -305,18 +311,48 @@ export function openTeamsChatPanel(): boolean {
   return true;
 }
 
+/** How long a send waits for the composer by default. Right after admission Teams is still
+ *  rendering the meeting shell: the control bar (and its chat toggle) can take several seconds to
+ *  mount, and the panel a moment more once opened. */
+export const TEAMS_CHAT_COMPOSER_WAIT_MS = 10000;
+/** How often the wait re-reads the DOM. */
+const TEAMS_CHAT_POLL_MS = 100;
+/** Most times one wait clicks a chat toggle (a re-rendered toggle may swallow the first click). */
+const TEAMS_CHAT_MAX_TOGGLE_CLICKS = 2;
+/** Least time between two toggle clicks, so a panel that is still mounting is not closed again. */
+const TEAMS_CHAT_TOGGLE_RECLICK_MS = 3000;
+
 const teamsSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-async function awaitTeamsComposer(waitMs: number): Promise<TeamsChatHit | null> {
-  let composer = findTeamsChatComposer();
-  if (!composer && openTeamsChatPanel()) {
-    const deadline = Date.now() + waitMs;
-    while (!composer && Date.now() < deadline) {
-      await teamsSleep(100);
-      composer = findTeamsChatComposer();
+/** Wait (bounded by `waitMs`) for a visible, editable composer. The panel is opened when a toggle
+ *  shows up, even one that mounts late (the control bar right after admission); a pressed toggle is
+ *  never clicked; a toggle is clicked again only once, after TEAMS_CHAT_TOGGLE_RECLICK_MS, when the
+ *  first click did not bring the composer (the bar re-rendered under it). */
+async function awaitTeamsComposer(waitMs: number, log: (m: string) => void = () => {}): Promise<TeamsChatHit | null> {
+  const start = Date.now();
+  const deadline = start + waitMs;
+  let clicks = 0;
+  let lastClick = 0;
+  for (;;) {
+    const composer = findTeamsChatComposer();
+    if (composer) {
+      if (clicks || Date.now() - start >= TEAMS_CHAT_POLL_MS) log(`chat send: composer ready after ${Date.now() - start} ms (${clicks} toggle click(s))`);
+      return composer;
     }
+    const toggle = findTeamsChatToggle();
+    const now = Date.now();
+    if (toggle && toggle.el.getAttribute('aria-pressed') !== 'true' && clicks < TEAMS_CHAT_MAX_TOGGLE_CLICKS
+      && (clicks === 0 || now - lastClick >= TEAMS_CHAT_TOGGLE_RECLICK_MS)) {
+      toggle.el.click();
+      clicks += 1;
+      lastClick = now;
+    }
+    if (now >= deadline) {
+      log(`chat send: no composer after ${now - start} ms (toggle ${toggle ? `via ${toggle.via}` : 'absent'}, ${clicks} click(s))`);
+      return null;
+    }
+    await teamsSleep(Math.min(TEAMS_CHAT_POLL_MS, Math.max(1, deadline - now)));
   }
-  return composer;
 }
 
 /** The texts of the message bodies in the chat list (the matched list, else the whole page). */
@@ -362,7 +398,7 @@ export async function prepareTeamsChatSend(
     m.removeAttribute(TEAMS_CHAT_COMPOSER_MARK);
     m.removeAttribute(TEAMS_CHAT_SEND_MARK);
   }
-  const composer = await awaitTeamsComposer(opts.waitMs ?? 3000);
+  const composer = await awaitTeamsComposer(opts.waitMs ?? TEAMS_CHAT_COMPOSER_WAIT_MS, log);
   if (!composer) { log('chat send: no visible Teams chat composer (panel would not open)'); return { composer: null, send: null, before: 0 }; }
   composer.el.setAttribute(TEAMS_CHAT_COMPOSER_MARK, '1');
   const send = findTeamsChatSendButton(composer.el);
@@ -398,7 +434,7 @@ export async function sendTeamsChatMessage(
 ): Promise<TeamsChatSendResult> {
   const log = opts.log || (() => {});
   if (!normalizeLine(text)) return { ok: false, reason: 'empty_text' };
-  const composer = await awaitTeamsComposer(opts.waitMs ?? 3000);
+  const composer = await awaitTeamsComposer(opts.waitMs ?? TEAMS_CHAT_COMPOSER_WAIT_MS, log);
   if (!composer) { log('chat send: no visible Teams chat composer'); return { ok: false, reason: 'no_composer' }; }
   const before = countTeamsChatLines(text);
   insertTeamsText(composer.el, text);
