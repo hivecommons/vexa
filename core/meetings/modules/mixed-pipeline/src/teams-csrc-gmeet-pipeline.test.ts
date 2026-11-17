@@ -1,6 +1,9 @@
 import {
   spanFitsCsrcOwnership,
+  TEAMS_NO_TRANSPORT_FALLBACK_MS,
+  TEAMS_NO_TRANSPORT_LANE,
   TeamsCsrcGmeetPipeline,
+  type TeamsNoTransportFallbackEvent,
   type TeamsCsrcTranscriptSegment,
 } from './teams-csrc-gmeet-pipeline.js';
 
@@ -302,6 +305,69 @@ await contestedPipeline.dispose();
   await leakPipeline.dispose();
   check('dispose leaves the window empty', leakPipeline.health().openSources === 0,
     JSON.stringify(leakPipeline.health()));
+}
+
+// ── No-transport fallback: a meeting whose transport never reports a CSRC still reaches STT. ──
+{
+  let fbNow = 0;
+  const fbCalls: number[] = [];
+  const fbRows: TeamsCsrcTranscriptSegment[] = [];
+  const fbEvents: TeamsNoTransportFallbackEvent[] = [];
+  const fb = new TeamsCsrcGmeetPipeline({
+    lookbackMs: 0,
+    flickerHoldMs: 0,
+    onsetGapMs: 1000,
+    buffer: { scheduleSubmissions: false, now: () => fbNow, silenceRmsThreshold: 0 },
+    onSegment: (segment) => { if (segment.completed && segment.text.trim()) fbRows.push(segment); },
+    onNoTransportFallback: (event) => fbEvents.push(event),
+    transcribe: async (audio) => {
+      fbCalls.push(audio.length);
+      return { text: 'no transport words', language: 'en', duration: 2, segments: [{ text: 'no transport words', start: 0, end: 2 } as any] };
+    },
+  });
+  // Silence never arms the fallback, however long it runs.
+  for (let i = 0; i < 40; i++) { fbNow = i * 500; fb.feedMixedAudio(new Float32Array(8000), fbNow); }
+  check('silence alone never engages the fallback lane', fbEvents.length === 0 && !fb.health().noTransportFallback,
+    JSON.stringify(fbEvents));
+  // Speech with no CSRC edge: held, then routed once the fallback arms.
+  const speechFrames = Math.ceil(TEAMS_NO_TRANSPORT_FALLBACK_MS / 500) + 2;
+  for (let i = 0; i < speechFrames; i++) { fbNow = 20_000 + i * 500; fb.feedMixedAudio(new Float32Array(8000).fill(0.1), fbNow); }
+  check('speech with no CSRC edge engages the fallback lane', fbEvents[0]?.engaged === true && fb.health().noTransportFallback,
+    JSON.stringify(fbEvents));
+  check('the held speech is routed on engagement, not dropped', fb.health().fallbackFrames === speechFrames,
+    JSON.stringify(fb.health()));
+  check('the fallback lane is the reserved no-transport lane', fb.activeCsrcs().includes(TEAMS_NO_TRANSPORT_LANE),
+    JSON.stringify(fb.activeCsrcs()));
+  await fb.requestTranscription(TEAMS_NO_TRANSPORT_LANE, true);
+  check('fallback audio reaches STT', fbCalls.length > 0, JSON.stringify(fbCalls));
+  // The first transport edge retires the fallback for good.
+  fbNow += 500;
+  fb.recordTransportEvent({ csrc: 777, active: true, tMs: fbNow });
+  await fb.flush();
+  check('fallback rows publish under the no-transport lane', fbRows.some((row) => row.csrc === TEAMS_NO_TRANSPORT_LANE),
+    JSON.stringify(fbRows));
+  check('the first CSRC edge retires the fallback lane', fbEvents[1]?.engaged === false && !fb.health().noTransportFallback,
+    JSON.stringify(fbEvents));
+  const before = fb.health().fallbackFrames;
+  for (let i = 0; i < 4; i++) { fbNow += 500; fb.feedMixedAudio(new Float32Array(8000).fill(0.1), fbNow); }
+  check('after retirement only CSRC routes audio', fb.health().fallbackFrames === before, JSON.stringify(fb.health()));
+  await fb.dispose();
+
+  // A working transport: the edge precedes the first word, so the fallback never engages.
+  const okEvents: TeamsNoTransportFallbackEvent[] = [];
+  const ok = new TeamsCsrcGmeetPipeline({
+    lookbackMs: 0, flickerHoldMs: 0, onsetGapMs: 1000,
+    buffer: { scheduleSubmissions: false, now: () => 0, silenceRmsThreshold: 0 },
+    onSegment: () => undefined,
+    onNoTransportFallback: (event) => okEvents.push(event),
+    transcribe: async () => ({ text: '', language: 'en', duration: 0, segments: [] }),
+  });
+  for (let i = 0; i < 20; i++) ok.feedMixedAudio(new Float32Array(8000), i * 500);
+  ok.recordTransportEvent({ csrc: 201, active: true, tMs: 10_000 });
+  for (let i = 0; i < 20; i++) ok.feedMixedAudio(new Float32Array(8000).fill(0.1), 10_000 + i * 500);
+  check('a transport that speaks first never engages the fallback', okEvents.length === 0 && ok.health().fallbackFrames === 0,
+    JSON.stringify(okEvents));
+  await ok.dispose();
 }
 
 if (failed > 0) process.exit(1);

@@ -15,7 +15,7 @@ import type { ChatSendResult } from './capture-bridge.js';
 import type { ChatSendReport } from './ports.js';
 
 export interface ActControllers {
-  speak: { speak(text: string, voice?: string): Promise<void>; stop(): Promise<void> };
+  speak: { speak(text: string, voice?: string): Promise<unknown>; stop(): Promise<void> };
   chat: { send(text: string): Promise<ChatSendResult> };
   /** Where a chat send that carried an `id` reports its outcome. */
   report?: (r: ChatSendReport) => Promise<void>;

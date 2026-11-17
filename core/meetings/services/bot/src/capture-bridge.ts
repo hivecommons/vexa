@@ -766,9 +766,11 @@ export async function startCaptureBridge(
   // The page serializes PCM as a plain number[] (Array.from(Float32Array)); we restore the
   // Float32Array and stamp the capture time if the page didn't supply one (production stamps
   // Date.now() on the Node side — index.ts:1598–1605).
+  const audioDiag = createAudioDiag();
   const onPerSpeakerAudio = (speakerIndex: number, samples: number[], tsMs?: number): void => {
     const pcm = new Float32Array(samples);
     const ts = tsMs ?? Date.now();
+    audioDiag.observe(pcm);
     observeRemoteAudio(pcm);
     tee(speakerIndex, pcm, ts);                                 // O-TEL-1: tap BEFORE the pipeline
     // Teams/Jitsi (useMix): one combined stream → the pyannote mixed lane. Zoom + gmeet: per-channel —
@@ -822,6 +824,13 @@ export async function startCaptureBridge(
     console.log(`[bot] hint-counters bridge-crossed=${hintsBridgeCrossed()} pipeline-received=${c?.received ?? 0} binder-matched=${c?.matched ?? 0} binder-missed=${c?.missed ?? 0} teams-captions=${captionsBridgeCrossed()} csrc-crossed=${csrcBridgeCrossed()} observations=${obsBridgeCrossed()}`);
   }, 30_000) : null;
   countersTimer?.unref?.();   // observability only — never holds the process open
+  // The audio hop, end to end on one line: what the page delivered (frames, RMS, peak) and what
+  // left for STT (chunks, audio seconds, bytes), plus when the first chunk went out relative to
+  // capture start. "Audio arrives, nothing is transcribed" and "nothing arrives" read differently.
+  const audioDiagTimer = useMix ? setInterval(() => {
+    console.log(audioDiag.line(pipeline.sttCounters));
+  }, AUDIO_DIAG_INTERVAL_MS) : null;
+  audioDiagTimer?.unref?.();
 
   await page.exposeFunction('__vexaPerSpeakerAudioData', onPerSpeakerAudio).catch((e: Error) => {
     if (!String(e.message).includes('already registered')) throw e;
@@ -850,7 +859,7 @@ export async function startCaptureBridge(
   // ── Start the page-side capture (VexaBrowserUtils preferred; production inline fallback). ──
   // The body of this callback runs IN THE BROWSER (Playwright serializes it); DOM globals are
   // reached via globalThis (this file type-checks against the Node lib — no DOM types here).
-  await page.evaluate(async ({ isMixed, isPerTrack, isJitsi, isTeams, isZoom, botName, mainAudioGraceMs, mainAudioSilenceMs, mainAudioEnergyRms }) => {
+  await page.evaluate(async ({ isMixed, isPerTrack, isJitsi, isTeams, isZoom, botName, mainAudioGraceMs, mainAudioSilenceMs, mainAudioEnergyRms, mixAudioDiagMs }) => {
     const w = (globalThis as any) as Record<string, any>;
     if (isMixed) {
       // Zoom/Teams/Jitsi ride the WebRTC hook (installRemoteAudioHook, installed pre-nav), which mirrors
@@ -1165,7 +1174,14 @@ export async function startCaptureBridge(
             for (let i = 0; i < pcm.length; i++) sum += pcm[i] * pcm[i];
             if (pcm.length && Math.sqrt(sum / pcm.length) >= mainAudioEnergyRms) {
               w.__vexaMixEnergeticMs = (w.__vexaMixEnergeticMs || 0) + (pcm.length / 16000) * 1000;
+              if (!w.__vexaMixFirstEnergyMs) {
+                w.__vexaMixFirstEnergyMs = Date.now();
+                w.logBot?.('[mixed] first audible frame ' + (Date.now() - (w.__vexaMixCaptureStartedMs || Date.now())) + 'ms after capture start');
+              }
             }
+            w.__vexaMixDiagFrames = (w.__vexaMixDiagFrames || 0) + 1;
+            w.__vexaMixDiagSamples = (w.__vexaMixDiagSamples || 0) + pcm.length;
+            w.__vexaMixDiagSumSq = (w.__vexaMixDiagSumSq || 0) + sum;
             // Stamp each frame with the ACCUMULATED-AUDIO-TIME clock the capture provides (tsMs = the
             // wall-clock of the audio the frame HOLDS — anchor + samples/rate — on the page clock, the same
             // domain as the hints' tMs). Passing that through (not Node RECEIPT time, and not Date.now() at
@@ -1201,6 +1217,34 @@ export async function startCaptureBridge(
       };
       setupMix();
       w.__vexaMixRescan = (globalThis as any).setInterval(setupMix, 2000); // pick up late-arriving tracks
+      // Page-side audio diagnostics: the AudioContext's state (a 'suspended' context delivers
+      // silence or nothing at all; resumed here, since a headless page never gets the user gesture
+      // autoplay policy waits for), the picked mix's RMS over the interval, and every connected
+      // track's readyState/muted — the three ways a "running" capture can still hear nothing.
+      if (!w.__vexaMixDiagTimer) {
+        w.__vexaMixDiagTimer = (globalThis as any).setInterval(() => {
+          try {
+            const ctx = w.__vexaMixCtx;
+            const state = ctx ? String(ctx.state) : 'none';
+            if (ctx && state === 'suspended') {
+              w.logBot?.('[mixed] AudioContext suspended — resuming');
+              Promise.resolve(ctx.resume?.()).catch((e: any) => w.logBot?.('[mixed] AudioContext resume failed: ' + String(e)));
+            }
+            const n = w.__vexaMixDiagSamples || 0;
+            const rms = n ? Math.sqrt((w.__vexaMixDiagSumSq || 0) / n) : 0;
+            const tracks: string[] = [];
+            for (const st of (w.__vexaMixStreamRefs || []) as Array<any>) {
+              for (const t of (st?.getAudioTracks?.() || [])) {
+                tracks.push(String(t.id || '').slice(0, 8) + ':' + t.readyState + (t.muted ? ':muted' : ''));
+              }
+            }
+            w.logBot?.('[mixed] audio-diag ctx=' + state + ' frames=' + (w.__vexaMixDiagFrames || 0)
+              + ' rms=' + rms.toFixed(4) + ' energetic-ms=' + Math.round(w.__vexaMixEnergeticMs || 0)
+              + ' tracks=[' + tracks.join(',') + ']');
+            w.__vexaMixDiagFrames = 0; w.__vexaMixDiagSamples = 0; w.__vexaMixDiagSumSq = 0;
+          } catch { /* observability must never break capture */ }
+        }, mixAudioDiagMs);
+      }
 
       // ── the transport sensor (mixed lane, EVERY platform) ────────────────────────────────────
       // RTP labels the server-side mix with the sources it mixed; the sensor turns that into turn
@@ -1375,7 +1419,8 @@ export async function startCaptureBridge(
       mainAudioGraceMs: Number(process.env.VEXA_TEAMS_MAIN_AUDIO_GRACE_MS || 15000),
       // How long a PICKED mix may stay wholly silent before the lane abandons it for every track.
       mainAudioSilenceMs: Number(process.env.VEXA_TEAMS_MAIN_AUDIO_SILENCE_MS || 20000),
-      mainAudioEnergyRms: Number(process.env.VEXA_TEAMS_MAIN_AUDIO_ENERGY_RMS || 0.006) }).catch((e) => {
+      mainAudioEnergyRms: Number(process.env.VEXA_TEAMS_MAIN_AUDIO_ENERGY_RMS || 0.006),
+      mixAudioDiagMs: AUDIO_DIAG_INTERVAL_MS }).catch((e) => {
     console.error(`[bot] capture bridge: page-side start failed: ${String(e)}`); // L4: surfaces only on the VM
   });
 
@@ -1390,6 +1435,7 @@ export async function startCaptureBridge(
   // Stop fn: tear the page-side capture down on teardown (best-effort; the page may be closing).
   return async () => {
     if (countersTimer) clearInterval(countersTimer);
+    if (audioDiagTimer) clearInterval(audioDiagTimer);
     activity?.unavailable();
     await page.evaluate(() => {
       const w = (globalThis as any) as Record<string, any>;
@@ -1409,6 +1455,7 @@ export async function startCaptureBridge(
       try { w.__vexaJitsiChat?.destroy?.(); w.__vexaJitsiChat = null; } catch { /* best-effort */ }
       try { w.__vexaZoomSpeakers?.destroy?.(); w.__vexaZoomSpeakers = null; } catch { /* best-effort */ }
       try { if (w.__vexaMixRescan) { (globalThis as any).clearInterval(w.__vexaMixRescan); w.__vexaMixRescan = null; } } catch { /* */ }
+      try { if (w.__vexaMixDiagTimer) { (globalThis as any).clearInterval(w.__vexaMixDiagTimer); w.__vexaMixDiagTimer = null; } } catch { /* */ }
       try {
         if (w.__vexaTrackCaps) {
           for (const e of w.__vexaTrackCaps.values()) {
@@ -1510,62 +1557,194 @@ export async function startRecording(page: Page, inv: Invocation, recording: Bot
  *
  * Production (services/vexa-bot/core/src/index.ts:595, 1039–1059 + services/tts-playback.ts)
  * does this at the OS level, not via a page fake-mic: a PulseAudio chain `tts_sink → virtual_mic`
- * is what Chromium captures as its microphone. The bot (a) unmutes the meeting-UI mic button
- * (page.evaluate clicks the platform's mic control), (b) writes synthesized PCM to the tts_sink
- * device (paplay) which feeds virtual_mic, then (c) re-mutes after a short tail.
+ * is what Chromium captures as its microphone. The bot (a) opens the meeting-UI mic and confirms it
+ * open from the control's own state, (b) writes synthesized PCM to the tts_sink device (paplay)
+ * which feeds virtual_mic. A line whose mic cannot be confirmed open is not played and fails
+ * `mic_muted`.
  *
  * This bot package does not own the PulseAudio/TTS process plumbing (that is the container
  * entrypoint + a TTS service, outside the bot's import surface), so here we wire only the
  * BROWSER half it CAN drive — the meeting-UI mic toggle — and leave a clearly-marked seam for
  * the OS-level audio injection the VM image provides. Speaking is gated on inv.voiceAgentEnabled.
  */
+/** Why a speak did not reach the meeting. `mic_muted`: the meeting-UI mic could not be confirmed
+ *  unmuted, so the line was NOT played (TTS into a muted mic is heard by no one). */
+export type SpeakFailure = 'voice_disabled' | 'mic_muted' | 'tts_failed' | 'stopped';
+
+/** The outcome of one speak: spoken only once the mic was confirmed open and TTS played.
+ *  `durationMs` is the audio actually played, in milliseconds. `stopped`: a barge-in (speak_stop)
+ *  cancelled the line before it played. */
+export type SpeakResult = { spoken: true; durationMs: number } | { spoken: false; reason: SpeakFailure };
+
 export interface SpeakController {
-  /** Begin speaking `text` (TTS synthesized + injected via the VM's PulseAudio chain). */
-  speak(text: string, voice?: string): Promise<void>;
-  /** Stop any in-flight speech (barge-in). */
+  /** Speak `text` (TTS synthesized + injected via the VM's PulseAudio chain). Lines are strictly
+   *  serial: one arriving while another plays waits for it to finish, and resolves when its own
+   *  playback ends. */
+  speak(text: string, voice?: string): Promise<SpeakResult>;
+  /** Stop the playing line and drop every queued one (barge-in). */
   stop(): Promise<void>;
 }
 
-export function createSpeakController(page: Page, inv: Invocation): SpeakController {
+/** The meeting-UI mic as the page shows it. */
+export type MicState = 'muted' | 'unmuted' | 'unknown';
+
+/** How long the meeting UI gets to repaint the mic control after a toggle. */
+export const MIC_SETTLE_MS = 400;
+/** Toggle attempts before the mic is reported as stuck muted. */
+export const MIC_UNMUTE_ATTEMPTS = 3;
+
+/** Each platform's keyboard mute toggle — the fallback when no mic button can be clicked. */
+const MIC_TOGGLE_SHORTCUT: Record<string, string> = {
+  teams: 'Control+Shift+M',
+  google_meet: 'Control+d',
+  zoom: 'Alt+a',
+  jitsi: 'm',
+};
+
+/**
+ * Read the meeting-UI mic state from the platform's own mic control (browser-side; serialized by
+ * Playwright, so it is self-contained). The control's accessible label is the authority: a button
+ * offering to UNMUTE (Teams "Unmute mic", Meet "Turn on microphone", Zoom "unmute my microphone")
+ * means the mic is muted, one offering to MUTE means it is open. `aria-pressed` / Meet's
+ * `data-is-muted` decide when the label says neither. Optionally clicks the control first.
+ */
+const MIC_CONTROL_SCRIPT = String.raw`({ platform, click }) => {
+  var doc = globalThis.document;
+  var bySelector = function (sels) {
+    for (var i = 0; i < sels.length; i++) { var el = doc && doc.querySelector(sels[i]); if (el) return el; }
+    return null;
+  };
+  var byLabel = function (re) {
+    var all = Array.from((doc && doc.querySelectorAll('button,[role="button"]')) || []);
+    return all.find(function (b) { return re.test(b.getAttribute('aria-label') || '') || re.test(b.getAttribute('title') || ''); }) || null;
+  };
+  var btn = null;
+  if (platform === 'teams') {
+    btn = bySelector(['#microphone-button', '[data-tid="microphone-button"]', '[data-inp="microphone-button"]'])
+      || byLabel(/\b(un)?mute mic\b/i) || byLabel(/microphone/i);
+  } else if (platform === 'zoom') {
+    btn = bySelector(['.join-audio-container__btn']) || byLabel(/(un)?mute my microphone/i) || byLabel(/microphone/i);
+  } else {
+    // The toggle itself before any other microphone-labelled control (Meet's settings menus).
+    btn = byLabel(/turn (on|off) microphone/i) || bySelector(['button[data-is-muted]'])
+      || byLabel(/toggle mute audio|\bmute audio/i) || byLabel(/microphone/i);
+  }
+  var read = function (b) {
+    if (!b) return 'unknown';
+    var label = ((b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('title') || '')).toLowerCase();
+    if (/\bunmute\b|turn on microphone|start audio|join audio/.test(label)) return 'muted';
+    if (/\bmute\b|turn off microphone/.test(label)) return 'unmuted';
+    var dataState = String(b.getAttribute('data-state') || '').toLowerCase();
+    if (/mic-?off|muted/.test(dataState)) return 'muted';
+    if (dataState === 'mic' || dataState === 'mic-on') return 'unmuted';
+    var dataMuted = b.getAttribute('data-is-muted');
+    if (dataMuted === 'true') return 'muted';
+    if (dataMuted === 'false') return 'unmuted';
+    var pressed = b.getAttribute('aria-pressed');
+    if (/toggle mute/.test(label) && pressed === 'true') return 'muted';
+    if (/toggle mute/.test(label) && pressed === 'false') return 'unmuted';
+    return 'unknown';
+  };
+  if (click && btn && !btn.disabled) btn.click();
+  return { found: !!btn, state: click ? 'unknown' : read(btn) };
+}`;
+
+/** Run MIC_CONTROL_SCRIPT in the page. It crosses as SOURCE TEXT, not a compiled function, so no
+ *  transpiler helper (e.g. a keep-names wrapper) can reach the page where it is undefined. */
+async function micControl(page: Page, platform: string, click: boolean): Promise<{ found: boolean; state: MicState }> {
+  return page.evaluate(`(${MIC_CONTROL_SCRIPT})(${JSON.stringify({ platform, click })})`) as Promise<{ found: boolean; state: MicState }>;
+}
+
+export function createSpeakController(
+  page: Page,
+  inv: Invocation,
+  /** The OS-level TTS→tts_sink half; injectable so the mic gate is provable without PulseAudio. */
+  ttsPlayback?: { speak(text: string, voice?: string): Promise<number | void>; stop(): void },
+): SpeakController {
   const enabled = !!inv.voiceAgentEnabled;
   const platform = inv.platform;
-  // OS-level TTS→tts_sink half. Only a bot that can speak prewarms its stock lines (BOT_TTS_PREWARM).
-  const tts = createTtsPlayback((m) => console.log(`[bot] ${m}`), enabled ? {} : { prewarmLines: [] });
+  // Only a bot that can speak prewarms its stock lines (BOT_TTS_PREWARM).
+  const tts = ttsPlayback ?? createTtsPlayback((m) => console.log(`[bot] ${m}`), enabled ? {} : { prewarmLines: [] });
 
-  // Toggle the meeting-UI mic button so the bot is audible only while speaking (production
-  // unmutes before speech + auto-mutes after — index.ts:1039–1059). The PulseAudio source
-  // (tts_sink → virtual_mic) is the actual audio path and is provided by the VM image.
-  const setMic = async (on: boolean): Promise<void> => {
-    // Runs IN THE BROWSER; reach the DOM via globalThis (no DOM types in this Node-typed file).
-    await page.evaluate(({ on, platform }) => {
-      const doc = (globalThis as any).document;
-      const click = (sel: string) => doc?.querySelector(sel)?.click();
-      if (platform === 'teams') click('#microphone-button');
-      else if (platform === 'zoom') click('.join-audio-container__btn');
-      else {
-        // Google Meet / Jitsi: the mic toggle is identified by its aria-label —
-        // "microphone" on Meet, "Toggle mute audio" on stock jitsi builds.
-        const btn = Array.from(doc?.querySelectorAll('[role="button"],button') ?? [])
-          .find((b: any) => /microphone|mute audio/i.test(b.getAttribute('aria-label') ?? '')) as any;
-        btn?.click();
+  const readMic = async (): Promise<{ found: boolean; state: MicState }> =>
+    micControl(page, platform, false).catch((e: unknown) => {
+      console.error(`[bot] speak: mic read failed: ${String(e).split('\n')[0]}`);
+      return { found: false, state: 'unknown' as MicState };
+    });
+
+  /**
+   * Open the meeting-UI mic and CONFIRM it is open. The mic stays open once opened: the virtual
+   * mic carries only TTS (silence between lines), so an open mic sends nothing but the bot's own
+   * speech, while a mute/unmute pair around every line is two more UI races per line and clips the
+   * first syllable on every unmute. It is re-checked before every line, so a host's "mute all" or a
+   * join that left the mic off is caught and repaired before the line plays, never after.
+   */
+  const ensureMicOpen = async (): Promise<boolean> => {
+    for (let attempt = 0; attempt <= MIC_UNMUTE_ATTEMPTS; attempt++) {
+      const mic = await readMic();
+      if (mic.state === 'unmuted') return true;
+      if (attempt === MIC_UNMUTE_ATTEMPTS) {
+        console.error(`[bot] speak: mic not confirmed open after ${MIC_UNMUTE_ATTEMPTS} toggle(s) (control ${mic.found ? 'found' : 'missing'}, state ${mic.state})`);
+        return false;
       }
-      void on; // toggle is a click; on/off intent is logged by the caller
-    }, { on, platform }).catch(() => { /* L4: best-effort UI drive */ });
+      // A readable control that says muted is clicked; with no readable control the platform's
+      // keyboard toggle is the only lever (its effect is verified by the next read, never assumed).
+      if (mic.found) {
+        await micControl(page, platform, true).catch(() => undefined);
+      } else if (MIC_TOGGLE_SHORTCUT[platform]) {
+        await page.keyboard.press(MIC_TOGGLE_SHORTCUT[platform]).catch(() => undefined);
+      }
+      console.log(`[bot] speak: mic ${mic.state}, toggled (attempt ${attempt + 1}/${MIC_UNMUTE_ATTEMPTS})`);
+      await page.waitForTimeout(MIC_SETTLE_MS).catch(() => undefined);
+    }
+    return false;
   };
 
+  const speakOne = async (text: string, voice?: string): Promise<SpeakResult> => {
+    console.log(`[bot] speak: "${text.slice(0, 60)}"`);
+    if (!(await ensureMicOpen())) {
+      console.error('[bot] speak_failed reason=mic_muted — the line was not played');
+      return { spoken: false, reason: 'mic_muted' };
+    }
+    // Synthesize via the TTS service + stream PCM to tts_sink → virtual_mic (the bot's mic).
+    let durationMs: number;
+    try {
+      durationMs = await tts.speak(text, voice) ?? 0;
+    } catch (e) {
+      console.error(`[bot] speak_failed reason=tts_failed: ${String(e)}`);
+      return { spoken: false, reason: 'tts_failed' };
+    }
+    console.log(`[bot] speak: spoken duration_ms=${durationMs} (mic confirmed open)`);
+    return { spoken: true, durationMs };
+  };
+
+  // ONE line at a time. Acts arrive concurrently (each act is handled as it lands), and two
+  // playbacks on one tts_sink MIX — the room hears both lines at once. Every line therefore waits
+  // for the one before it; a barge-in bumps the generation, which drops every line still queued.
+  let tail: Promise<unknown> = Promise.resolve();
+  let generation = 0;
+  let queued = 0;
+
   return {
-    async speak(text: string, voice?: string): Promise<void> {
-      if (!enabled) { console.error('[bot] speak ignored: voiceAgentEnabled is false'); return; }
-      console.log(`[bot] speak: "${text.slice(0, 60)}"`);
-      await setMic(true);                                     // (a) unmute the meeting-UI mic button
-      // (b) synthesize via the TTS service + stream PCM to tts_sink → virtual_mic (the bot's mic).
-      await tts.speak(text, voice).catch((e) => console.error(`[bot] speak: tts failed: ${String(e)}`));
-      await setMic(false);                                    // (c) re-mute after the tail
+    async speak(text: string, voice?: string): Promise<SpeakResult> {
+      if (!enabled) { console.error('[bot] speak ignored: voiceAgentEnabled is false'); return { spoken: false, reason: 'voice_disabled' }; }
+      const mine = generation;
+      if (queued > 0) console.log(`[bot] speak: queued behind ${queued} line(s)`);
+      queued++;
+      const run = tail.then(async (): Promise<SpeakResult> => {
+        if (mine !== generation) {
+          console.log('[bot] speak: dropped by speak_stop before it played');
+          return { spoken: false, reason: 'stopped' };
+        }
+        return speakOne(text, voice);
+      }).finally(() => { queued--; });
+      tail = run.catch(() => undefined);
+      return run;
     },
     async stop(): Promise<void> {
       if (!enabled) return;
+      generation++;                                           // drop every line still queued
       tts.stop();                                             // barge-in: kill playback + re-mute tts_sink
-      await setMic(false);
       console.log('[bot] speak_stop');
     },
   };
@@ -1718,6 +1897,47 @@ export function createChatSender(page: Page, inv: Invocation, opts: { landWaitMs
         return { sent: false, reason: 'page_error' };
       });
       return report(text, r);
+    },
+  };
+}
+
+/** How often the mixed lane logs its audio-hop diagnostics line. */
+export const AUDIO_DIAG_INTERVAL_MS = 10_000;
+
+/** Interval + cumulative audio statistics for the frames crossing the page boundary. */
+export function createAudioDiag(now: () => number = Date.now): {
+  observe(pcm: Float32Array): void;
+  line(stt?: { chunks: number; audioSec: number; pcmBytes: number; firstChunkAtMs?: number }): string;
+} {
+  const startedMs = now();
+  let totalFrames = 0;
+  let firstFrameAtMs: number | undefined;
+  let frames = 0;
+  let samples = 0;
+  let sumSq = 0;
+  let peak = 0;
+  return {
+    observe(pcm) {
+      if (firstFrameAtMs === undefined) firstFrameAtMs = now();
+      totalFrames++;
+      frames++;
+      samples += pcm.length;
+      for (let i = 0; i < pcm.length; i++) {
+        const v = pcm[i];
+        sumSq += v * v;
+        const a = Math.abs(v);
+        if (a > peak) peak = a;
+      }
+    },
+    line(stt) {
+      const rms = samples ? Math.sqrt(sumSq / samples) : 0;
+      const since = (t?: number): string => (t === undefined ? 'none' : `${t - startedMs}ms`);
+      const out = `[bot] audio-diag frames=${frames} rms=${rms.toFixed(4)} peak=${peak.toFixed(4)} `
+        + `frames-total=${totalFrames} first-frame=${since(firstFrameAtMs)} `
+        + `stt-chunks=${stt?.chunks ?? 0} stt-audio-sec=${(stt?.audioSec ?? 0).toFixed(1)} `
+        + `stt-pcm-bytes=${stt?.pcmBytes ?? 0} first-chunk=${since(stt?.firstChunkAtMs)}`;
+      frames = 0; samples = 0; sumSq = 0; peak = 0;
+      return out;
     },
   };
 }
