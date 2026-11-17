@@ -485,11 +485,18 @@ whose meeting-api has `TTS_SERVICE_URL` (an OpenAI-compatible `POST /v1/audio/sp
 key in `TTS_API_TOKEN`; the stock compose and chart do not set them, so add them with a compose
 override or the chart's `extraEnv`). Without `TTS_SERVICE_URL`, `POST /bots` refuses `voice_agent_enabled` with
 `422`. `POST …/speak` takes `{"text": "…", "voice"?: "…"}` (at most 1000 characters; only the
-meeting's owner) and answers `200 {"status": "queued", "meeting_id", "native_meeting_id"}` once the
-bot has received the line: `404` with no live meeting, `409` before the bot is admitted, when the bot
-was not sent with `voice_agent_enabled`, or when no bot is listening, `422` for an empty or too-long
-`text` or for `audio_url` / `audio_base64` (pre-rendered audio is not played), `429` past 5 lines in
-30 seconds to one meeting (with `Retry-After`). `DELETE …/speak` stops the current line and answers
+meeting's owner) and answers `200 {"status": "queued", "request_id", "meeting_id", "native_meeting_id"}`
+once the bot has received the line: `404` with no live meeting, `409` before the bot is admitted, when
+the bot was not sent with `voice_agent_enabled`, or when no bot is listening, `422` for an empty or
+too-long `text` or for `audio_url` / `audio_base64` (pre-rendered audio is not played), `429` past 5
+lines in 30 seconds to one meeting (with `Retry-After`). A bot plays its lines one after another.
+`GET …/speak/{request_id}` reads one line: `{"request_id", "status", "duration_ms"?, "reason"?,
+"meeting_id", "native_meeting_id"}`, where `status` is `queued` until the line starts, `speaking` once
+the meeting mic is confirmed open and playback starts, `spoken` with `duration_ms` (the milliseconds of
+audio played), or `failed` with `reason` (`mic_muted`: the meeting mic could not be confirmed open, so
+nothing was played; `tts_failed`; `stopped` by a stop; `voice_disabled`; `unconfirmed` when no answer
+came within 120 seconds; `unknown`). Only the sender can read it, for one hour; any other id is `404`.
+`DELETE …/speak` stops the current line, drops the queued ones, and answers
 `200 {"status": "stop_sent", "bots": <n>}`.
 </Note>
 

@@ -1576,11 +1576,16 @@ export type SpeakFailure = 'voice_disabled' | 'mic_muted' | 'tts_failed' | 'stop
  *  cancelled the line before it played. */
 export type SpeakResult = { spoken: true; durationMs: number } | { spoken: false; reason: SpeakFailure };
 
+/** Per-line callbacks. `onStart` fires once the mic is confirmed open, right before playback. */
+export interface SpeakHooks {
+  onStart?: () => void;
+}
+
 export interface SpeakController {
   /** Speak `text` (TTS synthesized + injected via the VM's PulseAudio chain). Lines are strictly
    *  serial: one arriving while another plays waits for it to finish, and resolves when its own
    *  playback ends. */
-  speak(text: string, voice?: string): Promise<SpeakResult>;
+  speak(text: string, voice?: string, hooks?: SpeakHooks): Promise<SpeakResult>;
   /** Stop the playing line and drop every queued one (barge-in). */
   stop(): Promise<void>;
 }
@@ -1700,7 +1705,7 @@ export function createSpeakController(
     return false;
   };
 
-  const speakOne = async (text: string, voice?: string): Promise<SpeakResult> => {
+  const speakOne = async (text: string, voice?: string, hooks?: SpeakHooks): Promise<SpeakResult> => {
     console.log(`[bot] speak: "${text.slice(0, 60)}"`);
     if (!(await ensureMicOpen())) {
       console.error('[bot] speak_failed reason=mic_muted — the line was not played');
@@ -1709,6 +1714,7 @@ export function createSpeakController(
     // Synthesize via the TTS service + stream PCM to tts_sink → virtual_mic (the bot's mic).
     let durationMs: number;
     try {
+      try { hooks?.onStart?.(); } catch { /* a report hook never stops the line */ }
       durationMs = await tts.speak(text, voice) ?? 0;
     } catch (e) {
       console.error(`[bot] speak_failed reason=tts_failed: ${String(e)}`);
@@ -1726,7 +1732,7 @@ export function createSpeakController(
   let queued = 0;
 
   return {
-    async speak(text: string, voice?: string): Promise<SpeakResult> {
+    async speak(text: string, voice?: string, hooks?: SpeakHooks): Promise<SpeakResult> {
       if (!enabled) { console.error('[bot] speak ignored: voiceAgentEnabled is false'); return { spoken: false, reason: 'voice_disabled' }; }
       const mine = generation;
       if (queued > 0) console.log(`[bot] speak: queued behind ${queued} line(s)`);
@@ -1736,7 +1742,7 @@ export function createSpeakController(
           console.log('[bot] speak: dropped by speak_stop before it played');
           return { spoken: false, reason: 'stopped' };
         }
-        return speakOne(text, voice);
+        return speakOne(text, voice, hooks);
       }).finally(() => { queued--; });
       tail = run.catch(() => undefined);
       return run;

@@ -243,6 +243,26 @@ async function main(): Promise<void> {
     check('chat_send_result: nothing on the live channel', publishes.length === 0, JSON.stringify(publishes));
   }
 
+  // ── speak_result: a spoken line's reports, signed on the same stream, nothing live ──
+  {
+    const { client, xadds, pubs: publishes } = fakeClient();
+    const token = 'eyJhbGciOiJIUzI1NiJ9.eyJtZWV0aW5nX2lkIjo1fQ.c2lnbmF0dXJl';
+    const sink = createRedisTranscriptSink({ client, meetingId: 5, token });
+    await sink.speakResult({ id: 'req-1', status: 'speaking' });
+    await sink.speakResult({ id: 'req-1', status: 'spoken', duration_ms: 2340 });
+    await sink.speakResult({ id: 'req-2', status: 'failed', reason: 'mic_muted' });
+    const [a, b, c] = xadds.map((x) => JSON.parse(x.fields.payload ?? '{}'));
+    check('speak_result: three signed entries on the transcription stream',
+      xadds.length === 3 && xadds.every((x) => x.key === TRANSCRIPTION_STREAM
+        && x.fields.sig === createHmac('sha256', token).update(x.fields.payload!).digest('hex')), JSON.stringify(xadds));
+    check('speak_result: speaking, spoken with duration_ms, failed with reason',
+      JSON.stringify(a) === JSON.stringify({ type: 'speak_result', meeting_id: 5, id: 'req-1', status: 'speaking' })
+        && JSON.stringify(b) === JSON.stringify({ type: 'speak_result', meeting_id: 5, id: 'req-1', status: 'spoken', duration_ms: 2340 })
+        && JSON.stringify(c) === JSON.stringify({ type: 'speak_result', meeting_id: 5, id: 'req-2', status: 'failed', reason: 'mic_muted' }),
+      JSON.stringify([a, b, c]));
+    check('speak_result: nothing on the live channel', publishes.length === 0, JSON.stringify(publishes));
+  }
+
   if (failed) { console.error(`\n❌ transcript-redis (L3): ${failed} check(s) FAILED.`); process.exit(1); }
   console.log('\n✅ transcript-redis (L3): XADDs the transcription_segments stream + PUBLISHes tc:meeting:{id}:mutable, payload round-trips a schema-valid transcript.v1 segment.');
 }

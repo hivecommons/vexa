@@ -1,8 +1,8 @@
 """speak — POST/DELETE /bots/{platform}/{native_meeting_id}/speak over the command bus.
 
 Pins, against the shipped app over in-memory fakes (no redis, no bot):
-  * POST publishes an ``acts.v1`` ``speak`` (exactly its declared fields) on the ACTIVE meeting's
-    ``bot_commands:meeting:{id}`` channel and answers ``queued``; ``voice`` rides only when it names
+  * POST publishes an ``acts.v1`` ``speak`` (exactly its declared fields, with the line's ``id``) on
+    the ACTIVE meeting's ``bot_commands:meeting:{id}`` channel and answers ``queued`` + ``request_id``; ``voice`` rides only when it names
     one (``auto`` is the default and is left out);
   * a bot sent without ``voice_agent_enabled`` is refused 409 BEFORE anything is published (the bot
     would drop the act and the caller would hear nothing);
@@ -99,12 +99,14 @@ def test_post_speak_publishes_a_speak_act_on_the_meetings_command_channel():
     r = client.post(URL, headers=H, json={"text": "Quorum is taking notes"})
 
     assert r.status_code == 200, r.text
-    assert r.json() == {"status": "queued", "meeting_id": m["id"], "native_meeting_id": NATIVE}
+    body = r.json()
+    assert body == {"status": "queued", "request_id": body["request_id"], "meeting_id": m["id"],
+                    "native_meeting_id": NATIVE}
     assert len(pub.published) == 1
     channel, raw = pub.published[0]
     assert channel == f"bot_commands:meeting:{m['id']}"
     act = json.loads(raw)
-    assert act == {"action": "speak", "text": "Quorum is taking notes"}
+    assert act == {"action": "speak", "text": "Quorum is taking notes", "id": body["request_id"]}
     ACT.validate(act)
 
 
@@ -114,8 +116,9 @@ def test_post_speak_carries_a_named_voice_and_leaves_auto_out():
     assert client.post(URL, headers=H, json={"text": "one", "voice": "en_US-amy"}).status_code == 200
     assert client.post(URL, headers=H, json={"text": "two", "voice": "auto"}).status_code == 200
     acts = [json.loads(raw) for _, raw in pub.published]
-    assert acts == [{"action": "speak", "text": "one", "voice": "en_US-amy"},
-                    {"action": "speak", "text": "two"}]
+    assert [{k: v for k, v in a.items() if k != "id"} for a in acts] == [
+        {"action": "speak", "text": "one", "voice": "en_US-amy"}, {"action": "speak", "text": "two"}]
+    assert all(isinstance(a.get("id"), str) and a["id"] for a in acts)
     for act in acts:
         ACT.validate(act)
 

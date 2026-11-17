@@ -567,3 +567,11 @@ class RedisBus(Protocol):
         """Apply a bot's ``chat_send_result`` to the chat send it names (``chat_delivery.py``):
         only a ``queued`` send into ``meeting_id`` changes. Returns whether one did."""
         ...
+
+    async def settle_speak(
+        self, request_id: str, *, meeting_id: int, status: str,
+        duration_ms: Optional[int] = None, reason: Optional[str] = None,
+    ) -> bool:
+        """Apply a bot's ``speak_result`` to the spoken line it names (``speak_delivery.py``): only a
+        forward move of a line sent into ``meeting_id`` changes it. Returns whether one did."""
+        ...

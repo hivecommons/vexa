@@ -18,7 +18,7 @@ const check = (name: string, cond: boolean, detail?: string) => {
 const calls: string[] = [];
 const dispatch = createActDispatch({
   speak: {
-    async speak(text, voice) { calls.push(`speak:${text}:${voice ?? ''}`); },
+    async speak(text, voice) { calls.push(`speak:${text}:${voice ?? ''}`); return { spoken: true, durationMs: 0 }; },
     async stop() { calls.push('speak_stop'); },
   },
   chat: { async send(text) { calls.push(`chat:${text}`); return { sent: true, via: 'test' }; } },
@@ -52,7 +52,7 @@ for (const act of [{ action: 'leave' }, { action: 'chat_read' }, { action: 'scre
   let outcome: { sent: true; via: string } | { sent: false; reason: 'not_landed' } = { sent: true, via: 'test' };
   const sent: string[] = [];
   const withReport = createActDispatch({
-    speak: { async speak() {}, async stop() {} },
+    speak: { async speak() { return { spoken: true as const, durationMs: 0 }; }, async stop() {} },
     chat: { async send(text) { sent.push(text); return outcome; } },
     report: async (r) => { reports.push(r); },
   });
@@ -83,13 +83,56 @@ for (const act of [{ action: 'leave' }, { action: 'chat_read' }, { action: 'scre
   check('a non-chat act reports nothing', reports.length === 0, JSON.stringify(reports));
 
   const failing = createActDispatch({
-    speak: { async speak() {}, async stop() {} },
+    speak: { async speak() { return { spoken: true as const, durationMs: 0 }; }, async stop() {} },
     chat: { async send() { return { sent: true, via: 'test' }; } },
     report: async () => { throw new Error('redis down'); },
   });
   let threw = false;
   try { await failing({ action: 'chat_send', text: 'still fine', id }); } catch { threw = true; }
   check('a report that fails never fails the act', !threw);
+}
+
+// ── a speak with an id reports speaking (at playback start), then its outcome; without an id, nothing ──
+{
+  const id = '0f1e2d3c4b5a69788796a5b4c3d2e1f0';
+  const reports: unknown[] = [];
+  let result: { spoken: true; durationMs: number } | { spoken: false; reason: 'mic_muted' } = { spoken: true, durationMs: 2340 };
+  const order: string[] = [];
+  const spoken = createActDispatch({
+    speak: {
+      async speak(_text, _voice, hooks) {
+        if (result.spoken) { hooks?.onStart?.(); order.push('played'); }
+        return result;
+      },
+      async stop() {},
+    },
+    chat: { async send() { return { sent: true, via: 'test' }; } },
+    speakReport: async (r) => { reports.push(r); order.push(`report:${r.status}`); },
+  });
+  await spoken({ action: 'speak', text: 'one moment', id });
+  check('a spoken line reports speaking, then spoken with duration_ms',
+    JSON.stringify(reports) === JSON.stringify([{ id, status: 'speaking' }, { id, status: 'spoken', duration_ms: 2340 }])
+      && order.indexOf('report:speaking') < order.indexOf('played'),
+    JSON.stringify({ reports, order }));
+
+  reports.length = 0;
+  result = { spoken: false, reason: 'mic_muted' };
+  await spoken({ action: 'speak', text: 'one moment', id });
+  check('a line refused at the mic reports failed mic_muted and never speaking',
+    JSON.stringify(reports) === JSON.stringify([{ id, status: 'failed', reason: 'mic_muted' }]), JSON.stringify(reports));
+
+  reports.length = 0;
+  await spoken({ action: 'speak', text: 'no id' });
+  check('a speak without an id reports nothing', reports.length === 0, JSON.stringify(reports));
+
+  const failing = createActDispatch({
+    speak: { async speak() { return { spoken: true as const, durationMs: 10 }; }, async stop() {} },
+    chat: { async send() { return { sent: true, via: 'test' }; } },
+    speakReport: async () => { throw new Error('redis down'); },
+  });
+  let threw = false;
+  try { await failing({ action: 'speak', text: 'still fine', id }); } catch { threw = true; }
+  check('a speak report that fails never fails the act', !threw);
 }
 
 console.log(failed ? `\n❌ ${failed} check(s) failed` : '\n✅ act-dispatch: all checks passed');

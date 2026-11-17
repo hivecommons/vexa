@@ -371,6 +371,27 @@ async def ingest(store: TranscriptStore, redis: RedisBus, message: dict) -> int:
         except Exception as e:  # noqa: BLE001 — best-effort, like every typed bus message
             _log_publish_failure(meeting_id, e)
         return 0
+    if msg_type == "speak_result":
+        # The bot's report for one spoken line (`speak_delivery.py`): `speaking`, then `spoken` with
+        # `duration_ms` or `failed` with a reason. It moves only a line sent into the meeting this
+        # entry's token names, and only forward. Nothing else is persisted or fanned out.
+        try:
+            meeting_id = int(data.get("meeting_id"))
+        except (TypeError, ValueError):
+            return 0
+        request_id, status = data.get("id"), data.get("status")
+        if not isinstance(request_id, str) or not isinstance(status, str):
+            return 0
+        duration_ms, reason = data.get("duration_ms"), data.get("reason")
+        try:
+            await redis.settle_speak(
+                request_id, meeting_id=meeting_id, status=status,
+                duration_ms=duration_ms if isinstance(duration_ms, int) and not isinstance(duration_ms, bool) else None,
+                reason=reason if isinstance(reason, str) else None,
+            )
+        except Exception as e:  # noqa: BLE001 — best-effort, like every typed bus message
+            _log_publish_failure(meeting_id, e)
+        return 0
     if msg_type not in ("transcription", "transcript"):
         # session_start / speaker events are out of scope for this segment unit.
         return 0

@@ -12,7 +12,11 @@
       "type": "object", "additionalProperties": false, "required": ["action"],
       "properties": { "action": { "const": "reconfigure" }, "language": { "type": ["string", "null"] }, "task": { "type": ["string", "null"] }, "allowedLanguages": { "type": "array", "items": { "type": "string" } } }
     },
-    "Speak": { "type": "object", "additionalProperties": false, "required": ["action", "text"], "properties": { "action": { "const": "speak" }, "text": { "type": "string" }, "voice": { "type": "string" } } },
+    "Speak": {
+      "description": "Say `text` aloud in the meeting. Lines play one after another. `id` names the line: the bot reports it as `speak_result` entries carrying that id on its signed `transcription_segments` stream (transcript.v1 `SpeakResult`): `speaking`, then `spoken` or `failed`. Without an id the bot reports nothing.",
+      "type": "object", "additionalProperties": false, "required": ["action", "text"],
+      "properties": { "action": { "const": "speak" }, "text": { "type": "string" }, "voice": { "type": "string" }, "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" } }
+    },
     "SpeakAudio": { "type": "object", "additionalProperties": false, "required": ["action"], "properties": { "action": { "const": "speak_audio" }, "url": { "type": "string" }, "audioBase64": { "type": "string" } } },
     "SpeakStop": { "type": "object", "additionalProperties": false, "required": ["action"], "properties": { "action": { "const": "speak_stop" } } },
     "ChatSend": {

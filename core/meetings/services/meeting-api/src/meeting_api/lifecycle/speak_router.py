@@ -30,7 +30,17 @@ Refusals of the POST, in the order they are checked:
     ``SPEAK_WINDOW_SEC``-second window; ``Retry-After`` says when the window turns.
   * ``503`` — the command bus (redis) is unreachable; nothing was sent.
 
-``200`` means a listening, voice-enabled bot RECEIVED the line (``status: "queued"``).
+``200`` means a listening, voice-enabled bot RECEIVED the line (``status: "queued"``), not yet that
+it was heard. The answer carries a ``request_id``: the act carries it to the bot, the bot reports the
+line on its signed stream (``speak_result``: ``speaking`` once the mic is confirmed open and playback
+starts, then ``spoken`` with ``duration_ms`` or ``failed`` with its reason, e.g. ``mic_muted``), and
+``GET /bots/{platform}/{native_meeting_id}/speak/{request_id}`` reads it — ``queued``, ``speaking``,
+``spoken`` (with ``duration_ms``, the milliseconds of audio played) or ``failed`` (with ``reason``;
+``unconfirmed`` when no answer came within ``SPEAK_UNCONFIRMED_AFTER_SEC``) (``speak_delivery.py``).
+Lines play one after another, so a caller pacing its lines waits for ``spoken`` or ``failed``. The
+record is written before the act goes out and removed again when nothing received it. The status
+read answers the SENDER only; ``404`` for an id that is unknown, expired, another user's, or not of
+this platform and meeting.
 
 The DELETE publishes ``speak_stop`` to every live row the caller owns for the room and answers
 ``200 {"status": "stop_sent", "bots": <listeners>}``; ``404`` when there is no live row.
@@ -38,12 +48,14 @@ The DELETE publishes ``speak_stop`` to every live row the caller owns for the ro
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 
 from ..bot_spawn.ports import MeetingRepo
 from ..regime import live_bot_guard
+from ..speak_delivery import SpeakDeliveryLedger
 from .chat_router import ChatRateLimit
 from .stop import leave_command_channel
 from .stop_router import _SUPPORTED_PLATFORMS, CommandPublisher, _active_rows, _resolve_user_id
@@ -65,11 +77,14 @@ _AUDIO_FIELDS = ("audio_url", "audio_base64")
 _IN_MEETING_STATUSES = frozenset({"active"})
 
 
-def speak_payload(text: str, voice: Optional[str]) -> dict:
-    """The ``acts.v1`` ``Speak`` body — exactly its declared fields (``voice`` only when given)."""
+def speak_payload(text: str, voice: Optional[str], request_id: Optional[str] = None) -> dict:
+    """The ``acts.v1`` ``Speak`` body — exactly its declared fields (``voice`` and ``id`` only when
+    given)."""
     act = {"action": "speak", "text": text}
     if voice:
         act["voice"] = voice
+    if request_id:
+        act["id"] = request_id
     return act
 
 
@@ -115,10 +130,13 @@ async def _speak_body(request: Request) -> tuple[str, Optional[str]]:
 
 
 def build_speak_router(repo: MeetingRepo, publisher: CommandPublisher,
-                       rate_limit: Optional[ChatRateLimit] = None) -> APIRouter:
-    """The speak and stop-speaking routes over the injected ``MeetingRepo`` + ``CommandPublisher``
-    ports. The per-meeting limit lives in the command bus's Redis unless ``rate_limit`` is given."""
+                       rate_limit: Optional[ChatRateLimit] = None,
+                       ledger: Optional[SpeakDeliveryLedger] = None) -> APIRouter:
+    """The speak, line-status and stop-speaking routes over the injected ``MeetingRepo`` +
+    ``CommandPublisher`` ports. The per-meeting limit and the line records live in the command bus's
+    Redis unless a ``rate_limit`` / ``ledger`` is given."""
     router = APIRouter()
+    lines = ledger or SpeakDeliveryLedger(publisher)
     limit = rate_limit or ChatRateLimit(publisher, limit=SPEAK_POSTS_PER_WINDOW,
                                         window=SPEAK_WINDOW_SEC, prefix=SPEAK_RATE_PREFIX)
 
@@ -171,16 +189,22 @@ def build_speak_router(repo: MeetingRepo, publisher: CommandPublisher,
                 headers={"Retry-After": str(retry_after)},
             )
 
+        # The record exists before the act goes out, so a result the bot sends back at once finds it.
+        request_id = uuid.uuid4().hex
         try:
+            await lines.record(request_id, user_id=user_id, meeting_id=meeting["id"],
+                               platform=platform, native_meeting_id=native_meeting_id)
             receivers = await publisher.publish(
-                leave_command_channel(meeting["id"]), json.dumps(speak_payload(text, voice))
+                leave_command_channel(meeting["id"]), json.dumps(speak_payload(text, voice, request_id))
             )
         except Exception as e:  # noqa: BLE001 — Redis unreachable → narrow, retryable failure
+            await _forget(lines, request_id)
             raise HTTPException(
                 status_code=503,
                 detail="bot command bus (redis) unavailable; nothing was said — retry",
             ) from e
         if isinstance(receivers, int) and receivers <= 0:
+            await _forget(lines, request_id)
             raise HTTPException(
                 status_code=409,
                 detail="no bot was listening in the meeting; nothing was said — retry once the "
@@ -190,9 +214,42 @@ def build_speak_router(repo: MeetingRepo, publisher: CommandPublisher,
         _log_speak("speak_queued", user_id, meeting["id"], {"chars": len(text)})
         return {
             "status": "queued",
+            "request_id": request_id,
             "meeting_id": meeting["id"],
             "native_meeting_id": native_meeting_id,
         }
+
+    @router.get("/bots/{platform}/{native_meeting_id}/speak/{request_id}")
+    async def speak_status(
+        platform: str,
+        native_meeting_id: str,
+        request_id: str,
+        x_user_id: Optional[str] = Header(default=None),
+    ):
+        user_id = _resolve_user_id(x_user_id)
+        _check_platform(platform)
+        try:
+            record = await lines.read(request_id)
+        except Exception as e:  # noqa: BLE001 — the records live on the command bus
+            raise HTTPException(
+                status_code=503, detail="bot command bus (redis) unavailable — retry",
+            ) from e
+        # Another user's line, or one sent into a different meeting, is indistinguishable from none.
+        if (record is None or record.get("user_id") != user_id
+                or record.get("platform") != platform
+                or record.get("native_meeting_id") != native_meeting_id):
+            raise HTTPException(status_code=404, detail="No such spoken line")
+        answer = {
+            "request_id": request_id,
+            "status": record["status"],
+            "meeting_id": record.get("meeting_id"),
+            "native_meeting_id": native_meeting_id,
+        }
+        if record["status"] == "spoken":
+            answer["duration_ms"] = int(record.get("duration_ms") or 0)
+        if record["status"] == "failed":
+            answer["reason"] = record.get("reason") or "unknown"
+        return answer
 
     @router.delete("/bots/{platform}/{native_meeting_id}/speak",
                    dependencies=[Depends(live_bot_guard("DELETE", "/bots/{platform}/{native_meeting_id}/speak"))])
@@ -222,6 +279,14 @@ def build_speak_router(repo: MeetingRepo, publisher: CommandPublisher,
         return {"status": "stop_sent", "bots": listeners}
 
     return router
+
+
+async def _forget(lines: SpeakDeliveryLedger, request_id: str) -> None:
+    """Remove the record of a line that never went out; it expires on its own if this fails too."""
+    try:
+        await lines.discard(request_id)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _log_speak(event: str, user_id, meeting_id, fields: dict) -> None:

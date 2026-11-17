@@ -22,7 +22,7 @@
 import { createHmac } from 'node:crypto';
 import { createClient } from 'redis';
 import type { TranscriptSegment } from '../contracts.js';
-import type { ChatSendReport, TranscriptionProgressReport, TranscriptSink } from '../ports.js';
+import type { ChatSendReport, SpeakReport, TranscriptionProgressReport, TranscriptSink } from '../ports.js';
 import { makeLazyConnect } from './redis-lazy-connect.js';
 import { botReconnectStrategy, type BotRedisOptions } from './redis-terminal.js';
 
@@ -66,10 +66,13 @@ export interface RedisTranscriptSinkOptions {
   liveEnvelope?: 'segment' | 'speaker-snapshot';
 }
 
-/** The live sink: the transcript, plus the chat-send outcome that rides the same signed stream. */
+/** The live sink: the transcript, plus the chat-send and speak outcomes that ride the same signed
+ *  stream. */
 export interface RedisTranscriptSink extends TranscriptSink {
   /** Report one chat send's outcome to meeting-api (transcript.v1 `ChatSendResult`). */
   chatSendResult(r: ChatSendReport): Promise<void>;
+  /** Report one spoken line's progress or outcome to meeting-api (transcript.v1 `SpeakResult`). */
+  speakResult(r: SpeakReport): Promise<void>;
 }
 
 /** Build the live transcript sink. `publish` XADDs the durable feed AND publishes the live
@@ -200,7 +203,14 @@ export function createRedisTranscriptSink(opts: RedisTranscriptSinkOptions): Red
     await client.xAdd(TRANSCRIPTION_STREAM, '*', { payload, ...entryAuth(token, payload) });
   }
 
-  return { publish, retract, progress, chatSendResult };
+  /** A spoken line's report on the same signed stream; the collector moves the line it names
+   *  forward and nothing else (meeting-api `speak_delivery.py`). */
+  async function speakResult(r: SpeakReport): Promise<void> {
+    const payload = JSON.stringify({ type: 'speak_result', meeting_id: meetingId, ...r });
+    await client.xAdd(TRANSCRIPTION_STREAM, '*', { payload, ...entryAuth(token, payload) });
+  }
+
+  return { publish, retract, progress, chatSendResult, speakResult };
 }
 
 /** A live transcript client that also exposes connect/quit so the composition root can

@@ -54,6 +54,10 @@ parent's FM-003 discipline). `active → joining` (and any re-open of a terminal
   to the bot; `GET …/chat/{request_id}` reads the send's outcome (`queued` · `posted` · `failed` +
   the bot's reason · `unconfirmed` after `UNCONFIRMED_AFTER_SEC`), sender only, from the record
   `../chat_delivery.py` keeps and the collector settles from the bot's `chat_send_result`.
+  `POST …/speak` answers a `request_id` the same way; `GET …/speak/{request_id}` reads the line
+  (`queued` · `speaking` · `spoken` + `duration_ms` · `failed` + reason, `unconfirmed` after
+  `SPEAK_UNCONFIRMED_AFTER_SEC`) from `../speak_delivery.py`, which the collector moves forward from
+  the bot's `speak_result`.
 - `retry.py` (P3d) — `JoinRetryController` + the transient/permanent taxonomy
   (`classify_retry` / `is_transient`): on a TRANSIENT join-failure schedule a fresh re-spawn (a new
   `meeting_session`) through the runtime scheduler with bounded exponential backoff; a PERMANENT
