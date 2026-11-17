@@ -1,0 +1,56 @@
+# ci: build + unit tests for the TypeScript services this fork patches (the meeting bot and the
+# mixed-pipeline module it depends on). No images, no deploys, no secrets: quorum-images.yml owns
+# publishing. The required status check is the job name below ("bot build and test").
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Keep in step with packageManager in package.json and the bot Dockerfile (node 22, pnpm 11.7.0).
+  NODE_VERSION: "22"
+  PNPM_VERSION: "11.7.0"
+  # Packages this fork modifies, as pnpm filters. "..." also selects their workspace dependencies.
+  BOT_FILTER: "@vexa/bot..."
+  MIXED_PIPELINE_FILTER: "@vexa/mixed-pipeline"
+  BOT_PACKAGE: "@vexa/bot"
+
+jobs:
+  bot:
+    name: bot build and test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Build bot and its workspace dependencies
+        run: pnpm --filter "$BOT_FILTER" run build
+
+      - name: Test mixed-pipeline
+        if: ${{ !cancelled() }}
+        run: pnpm --filter "$MIXED_PIPELINE_FILTER" run test
+
+      - name: Test bot
+        if: ${{ !cancelled() }}
+        run: pnpm --filter "$BOT_PACKAGE" run test
