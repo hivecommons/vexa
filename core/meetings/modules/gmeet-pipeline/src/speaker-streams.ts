@@ -118,6 +118,9 @@ interface SpeakerBuffer {
   /** The lane closed this stretch itself (end of utterance, idle) while a request was in flight: an
    *  answer whose window covers the whole stretch is used as its final instead of sending it again. */
   finalFromCoveringAnswer?: boolean;
+  /** Set while the answer to a FINAL window (end of utterance, turn close, idle) is being published:
+   *  the segment it confirms is reported as final (see onSegmentConfirmed). */
+  emittingFinal?: boolean;
   /** The most recent window sent to STT carried speech-level audio (short answers are then real). */
   lastSubmitVoiced?: boolean;
   /** Wall-clock time (ms) when the current unconfirmed window started */
@@ -344,6 +347,8 @@ export class SpeakerStreamManager {
   private held: { buffer: SpeakerBuffer; deliver: () => void }[] = [];
   /** One manager-level tick for detached stretches (stall resends, retries, order holds). */
   private sweepTimer: ReturnType<typeof setInterval> | undefined;
+  /** Per speaker: when the last frame at or above their speech bar arrived (pauseFinalMs > 0). */
+  private lastSpeechAtMs: Map<string, number> = new Map();
   /** Request numbers, manager-wide (they name requests in log lines). */
   private requestSeq = 0;
   /** Wall-clock time (ms) of the last voiced frame fed, any speaker. */
@@ -362,8 +367,14 @@ export class SpeakerStreamManager {
   /** Called when unconfirmed audio needs transcription. */
   onSegmentReady: ((speakerId: string, speakerName: string, audioBuffer: Float32Array, requestId: number) => void) | null = null;
 
-  /** Called when a segment is confirmed and should be published. */
-  onSegmentConfirmed: ((speakerId: string, speakerName: string, transcript: string, bufferStartMs: number, bufferEndMs: number, segmentId: string, language?: string) => void) | null = null;
+  /** Called when a segment is confirmed and should be published. `final` is true when the text is
+   *  the answer to a FINAL window: one request over everything the stretch still held, sent when the
+   *  speaker stopped (end of utterance, turn close, idle), not a draft window cut while they spoke. */
+  onSegmentConfirmed: ((speakerId: string, speakerName: string, transcript: string, bufferStartMs: number, bufferEndMs: number, segmentId: string, language?: string, final?: boolean) => void) | null = null;
+
+  /** Called when a speaker's utterance ends (quiet for pauseFinalMs after speech) and its last
+   *  window goes out as a final. The answer arrives later through onSegmentConfirmed. */
+  onUtteranceEnd: ((speakerId: string) => void) | null = null;
 
   /** Called with the UNCONFIRMED forming tail after each submission (the "pending"
    *  draft) — parity with ChunkedTranscriber's publishPending, so the multistream
@@ -464,6 +475,11 @@ export class SpeakerStreamManager {
     if (!buffer) return Infinity;
     const now = Date.now();
     // No frames at all is silence (captures gate silent chunks); quiet frames count from the first.
+    // With end-of-utterance tracking the clock runs from the last frame that reached the speech
+    // bar. (The buffer's own clocks restart whenever an utterance is detached, which would count
+    // the quiet from the detach, pauseFinalMs late.)
+    const spokeAt = this.lastSpeechAtMs.get(speakerId);
+    if (this.pauseFinalMs > 0 && spokeAt !== undefined) return now - spokeAt;
     const noFrames = now - buffer.lastAudioTimestamp;
     return buffer.quietSinceMs !== undefined ? Math.max(noFrames, now - buffer.quietSinceMs) : noFrames;
   }
@@ -637,7 +653,7 @@ export class SpeakerStreamManager {
       // Quiet means below the speaker's speech bar (the speech gate's: 4x their noise floor, at least
       // silenceRmsThreshold), not merely below the fixed threshold: steady room noise (a fan, a hum)
       // is louder than 0.0025 RMS and used to hold a turn open for as long as it lasted.
-      if (level >= this.speechBar(speakerId)) { buffer.quietSinceMs = undefined; buffer.voicedSinceFinal = true; }
+      if (level >= this.speechBar(speakerId)) { buffer.quietSinceMs = undefined; buffer.voicedSinceFinal = true; this.lastSpeechAtMs.set(speakerId, Date.now()); }
       else if (buffer.quietSinceMs === undefined) buffer.quietSinceMs = atMs ?? Date.now();
     }
   }
@@ -686,6 +702,13 @@ export class SpeakerStreamManager {
       buffer.idleSubmitted = true;
       log(`[SpeakerStreams] Final from the answer in flight for "${buffer.speakerName}" (its window covered the whole stretch)`);
     }
+    // An OLDER draft answered while the request that covers the whole stretch is still in flight
+    // (pipelined drafts): that one is the final. Sending the same audio a third time now would
+    // supersede it and put a whole extra round trip between the pause and the confirmed text.
+    if (buffer.pendingFinal && buffer.finalFromCoveringAnswer && buffer.capCutSample === undefined
+        && buffer.inFlight && this.coveredInFlight(buffer)) {
+      return false;
+    }
     if (buffer.pendingFinal) {
       buffer.pendingFinal = false;
       buffer.capCutSample = undefined;
@@ -731,7 +754,8 @@ export class SpeakerStreamManager {
 
     // Idle/flush submit — emit immediately, this is the last chance
     if (buffer.idleSubmitted) {
-      this.emitSegment(buffer, trimmed);
+      buffer.emittingFinal = true;
+      try { this.emitSegment(buffer, trimmed); } finally { buffer.emittingFinal = false; }
       this.fullReset(buffer, 'transcribed');
       return true;
     }
@@ -861,6 +885,7 @@ export class SpeakerStreamManager {
     }
 
     this.buffers.delete(speakerId);
+    this.lastSpeechAtMs.delete(speakerId);
   }
 
   hasSpeaker(speakerId: string): boolean {
@@ -1111,7 +1136,8 @@ export class SpeakerStreamManager {
     const text = cleanRepeats(raw, buffer.lastConfirmedText);
     if (!text) return;
     const lang = buffer.lastLanguage;
-    const deliver = () => this.onSegmentConfirmed?.(buffer.speakerId, buffer.speakerName, text, startMs, endMs, segmentId, lang);
+    const final = buffer.emittingFinal === true;
+    const deliver = () => this.onSegmentConfirmed?.(buffer.speakerId, buffer.speakerName, text, startMs, endMs, segmentId, lang, final);
     if (this.isBlocked(buffer)) { this.held.push({ buffer, deliver }); return; }
     deliver();
   }
@@ -1350,9 +1376,39 @@ export class SpeakerStreamManager {
     if (detachedNow >= SpeakerStreamManager.MAX_DETACHED_PER_SPEAKER) return false;
     buffer.voicedSinceFinal = false;
     const detached = this.detach(buffer);
-    if (detached.inFlight) { detached.pendingFinal = true; detached.finalFromCoveringAnswer = true; }
-    else void this.finalSubmit(detached, noFrames && !quietFrames ? 'end of utterance (no audio)' : 'end of utterance');
+    const why = noFrames && !quietFrames ? 'end of utterance (no audio)' : 'end of utterance';
+    if (!detached.inFlight) {
+      void this.finalSubmit(detached, why);
+    } else if (this.finalBesideDraft(detached)) {
+      // The draft in flight was cut while the speaker was still talking: its answer cannot be the
+      // final. The final window goes out NOW, beside it, instead of after its round trip.
+      log(`[SpeakerStreams] End of utterance for "${detached.speakerName}" with a draft in flight: final window sent beside it ` +
+          `(${(this.unconfirmedSamples(detached) / this.sampleRate).toFixed(1)}s audio)`);
+      void this.finalSubmit(detached, why);
+    } else {
+      detached.pendingFinal = true; detached.finalFromCoveringAnswer = true;
+    }
+    try { this.onUtteranceEnd?.(buffer.speakerId); } catch { /* a listener never disturbs the lane */ }
     return true;
+  }
+
+  /** At an end of utterance with a request in flight: may the final window be sent at once, beside
+   *  it? Only on a pipelined lane (several requests per speaker are its normal state), with room
+   *  under maxInFlightPerSpeaker and no STT back-off, and only when no request in flight already
+   *  covers the whole stretch (that answer IS the final: sending the same audio again would be a
+   *  wasted round trip). */
+  private finalBesideDraft(stretch: SpeakerBuffer): boolean {
+    if (!this.pipelineDrafts || this.sttPressure?.backingOff()) return false;
+    if (stretch.outstanding.size >= this.maxInFlight) return false;
+    return !this.coveredInFlight(stretch);
+  }
+
+  /** Is a request in flight whose window runs from the stretch's first unconfirmed sample to its
+   *  very end? Its answer is the transcription of the final window. */
+  private coveredInFlight(stretch: SpeakerBuffer): boolean {
+    const start = stretch.absBase + stretch.confirmedSamples, end = stretch.absBase + stretch.totalSamples;
+    for (const r of stretch.outstanding.values()) if (!r.superseded && r.baseAbs === start && r.endAbs === end) return true;
+    return false;
   }
 
   private async trySubmit(speakerId: string): Promise<void> {

@@ -16,7 +16,7 @@ import addFormats from 'ajv-formats';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createOrchestrator, CONTROL_PLANE_UNREACHABLE, CONTROL_PLANE_UNREACHABLE_EXIT, type MeetingResult } from './orchestrator.js';
+import { createOrchestrator, CONTROL_PLANE_UNREACHABLE, CONTROL_PLANE_UNREACHABLE_EXIT, LEAVE_DRAIN_MS, leaveDrainMsFromEnv, type MeetingResult } from './orchestrator.js';
 import { createLivePipeline } from './pipeline.js';
 import { canTransition, type Act, type BotStatus, type LifecycleEvent, type TranscriptSegment } from './contracts.js';
 import type { ActsSource, JoinDriver, JoinOutcome, LifecycleSink, TranscriptSink, PrimaryReachability } from './ports.js';
@@ -134,6 +134,49 @@ async function main(): Promise<void> {
     setTimeout(() => { void o.handle({ action: 'leave' }); }, 5);
     const res = await runP;
     check('handle(leave): completed(stopped)', res.status === 'completed' && last(lc.events).completion_reason === 'stopped');
+  }
+
+  // ── a `leave` waits (bounded) for the last line or chat send before the platform leave ──
+  {
+    const order: string[] = [];
+    const join: JoinDriver = { ...mockJoin('admitted'), async leave() { order.push('leave'); } };
+    const o = createOrchestrator(inv(), {
+      lifecycle: recordingSink(), join, pipeline: noopPipeline(), acts: noopActs(), aloneness: noopAloneness(),
+      beforeLeave: async () => { await new Promise((r) => setTimeout(r, 60)); order.push('last line spoken'); },
+    });
+    const runP = o.run();
+    setTimeout(() => { void o.handle({ action: 'leave' }); }, 5);
+    await runP;
+    check('leave: the last line finishes before the platform leave', order.join(',') === 'last line spoken,leave', order.join(','));
+  }
+  {
+    const order: string[] = [];
+    const join: JoinDriver = { ...mockJoin('admitted'), async leave() { order.push('leave'); } };
+    const o = createOrchestrator(inv(), {
+      lifecycle: recordingSink(), join, pipeline: noopPipeline(), acts: noopActs(), aloneness: noopAloneness(),
+      beforeLeave: () => new Promise<void>(() => { /* a line that never ends */ }), leaveDrainMs: 80,
+    });
+    const runP = o.run();
+    const t0 = Date.now();
+    setTimeout(() => { void o.handle({ action: 'leave' }); }, 5);
+    const res = await runP;
+    check('leave: a line that never ends holds the leave only for the bound',
+      order.join(',') === 'leave' && Date.now() - t0 >= 80 && Date.now() - t0 < 1000 && res.status === 'completed', `${Date.now() - t0} ms`);
+  }
+  {
+    let asked = 0;
+    let fireRemoval: () => void = () => {};
+    const o = createOrchestrator(inv(), {
+      lifecycle: recordingSink(), join: mockJoin('admitted', (f) => { fireRemoval = f; }), pipeline: noopPipeline(), acts: noopActs(), aloneness: noopAloneness(),
+      beforeLeave: async () => { asked++; },
+    });
+    const runP = o.run();
+    setTimeout(() => fireRemoval(), 5);
+    await runP;
+    check('a bot removed from the meeting does not wait to speak', asked === 0, String(asked));
+    check('BOT_LEAVE_DRAIN_MS: default, override, bound, invalid',
+      leaveDrainMsFromEnv({}) === LEAVE_DRAIN_MS && leaveDrainMsFromEnv({ BOT_LEAVE_DRAIN_MS: '0' }) === 0
+        && leaveDrainMsFromEnv({ BOT_LEAVE_DRAIN_MS: '60000' }) === 8000 && leaveDrainMsFromEnv({ BOT_LEAVE_DRAIN_MS: 'x' }) === LEAVE_DRAIN_MS);
   }
 
   // ── join throws → failed(joining/join_failure) ──

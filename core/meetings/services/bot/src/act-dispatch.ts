@@ -4,8 +4,9 @@
  *   • speak / speak_stop → the SpeakController (gated inside it on voiceAgentEnabled). When a speak
  *                          carries an `id`, its progress goes back through the injected `speakReport`
  *                          (transcript.v1 `SpeakResult`): `speaking` once the mic is confirmed open
- *                          and playback starts, then `spoken` with `duration_ms` or `failed` with the
- *                          controller's `SpeakFailure` reason.
+ *                          and synthesis starts, then `spoken` with `duration_ms` and where the
+ *                          line's time went (`queue_ms`, `mic_ms`, `first_audio_ms`, `synth_ms`,
+ *                          `cached`), or `failed` with the controller's `SpeakFailure` reason.
  *   • chat_send          → the ChatSender (ungated — a text act, not a voice one). When the act
  *                          carries an `id`, its outcome goes back to meeting-api through the injected
  *                          `report` (a transcript.v1 `ChatSendResult` on the signed stream): `posted`,
@@ -27,7 +28,12 @@ export interface ActControllers {
   speakReport?: (r: SpeakReport) => Promise<void>;
 }
 
-export function createActDispatch(c: ActControllers): (act: Act) => Promise<void> {
+/** The in-meeting act handler, plus `idle()`: resolves once no speak or chat send it took is still
+ *  in progress (the orchestrator waits on it, bounded, before the platform leave, so a last line
+ *  is heard or posted). */
+export type ActDispatch = ((act: Act) => Promise<void>) & { idle(): Promise<void> };
+
+export function createActDispatch(c: ActControllers): ActDispatch {
   const report = async (r: ChatSendReport): Promise<void> => {
     if (!c.report) return;
     // Best-effort: a lost report reads as `unconfirmed` on meeting-api's side, never as a failure here.
@@ -38,14 +44,22 @@ export function createActDispatch(c: ActControllers): (act: Act) => Promise<void
     // Best-effort: a lost report reads as `unconfirmed` on meeting-api's side, never as a failure here.
     await c.speakReport(r).catch((e) => console.error(`[bot] speak_result not reported: ${String(e)}`));
   };
-  return async (act) => {
+  const int = (v: number): number => Math.max(0, Math.round(v));
+  const handle = async (act: Act): Promise<void> => {
     if (act.action === 'speak') {
       const id = typeof act.id === 'string' && act.id ? act.id : undefined;
       const r = await c.speak.speak(act.text, act.voice,
         id ? { onStart: () => { void reportSpeak({ id, status: 'speaking' }); } } : undefined);
       if (id) {
+        const t = r.spoken ? r.timing : undefined;
         await reportSpeak(r.spoken
-          ? { id, status: 'spoken', duration_ms: Math.max(0, Math.round(r.durationMs)) }
+          ? {
+            id, status: 'spoken', duration_ms: int(r.durationMs),
+            ...(t ? { queue_ms: int(t.queueMs), mic_ms: int(t.micMs) } : {}),
+            ...(t?.firstAudioMs !== undefined ? { first_audio_ms: int(t.firstAudioMs) } : {}),
+            ...(t?.synthMs !== undefined ? { synth_ms: int(t.synthMs) } : {}),
+            ...(t?.cached !== undefined ? { cached: t.cached } : {}),
+          }
           : { id, status: 'failed', reason: r.reason });
       }
     }
@@ -61,4 +75,15 @@ export function createActDispatch(c: ActControllers): (act: Act) => Promise<void
       if (id) await report(r.sent ? { id, posted: true } : { id, posted: false, reason: r.reason });
     }
   };
+  const busy = new Set<Promise<void>>();
+  const dispatch = (act: Act): Promise<void> => {
+    if (act.action !== 'speak' && act.action !== 'chat_send') return handle(act);
+    const p = handle(act);
+    const tracked = p.catch(() => undefined).finally(() => { busy.delete(tracked); });
+    busy.add(tracked);
+    return p;
+  };
+  return Object.assign(dispatch, {
+    async idle(): Promise<void> { while (busy.size) await Promise.all([...busy]); },
+  });
 }

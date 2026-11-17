@@ -47,6 +47,10 @@ export interface TeamsCsrcGmeetPipelineOptions {
   ) => Promise<TranscriptionResult>;
   onSegment: (segment: TeamsCsrcTranscriptSegment) => void;
   onRejectedOwnership?: (segment: TeamsCsrcTranscriptSegment, intervals: CsrcOwnershipInterval[]) => void;
+  /** A confirmed segment lay outside its CSRC's interval and was published anyway, because no
+   *  other lane was routed any of its audio. `offsetMs` is how far the segment's start (capture
+   *  clock) sits before the nearest interval start (transport clock): the clocks' disagreement. */
+  onUncontestedOwnership?: (segment: TeamsCsrcTranscriptSegment, offsetMs: number, intervals: CsrcOwnershipInterval[]) => void;
   /** Evaluation/telemetry seam: every frame the smoothed channelizer actually routes. */
   onRoutedFrame?: (frame: TeamsCsrcVirtualFrame) => void;
   onError?: (error: unknown) => void;
@@ -121,6 +125,9 @@ export interface TeamsCsrcGmeetPipelineHealth extends TeamsCsrcChannelizerHealth
   openSources: number;
   inFlight: number;
   rejectedOwnership: number;
+  /** Confirmed segments outside their CSRC interval that were published because the lane was the
+   *  only one routed that audio. Non-zero means the capture and transport clocks disagree. */
+  uncontestedOwnership: number;
   timeoutPromotions: number;
   contestedPairs: number;
   /** True while the mix rides the no-transport fallback lane. */
@@ -222,6 +229,7 @@ export class TeamsCsrcGmeetPipeline {
   /** Windows given up after the final-pass deadline — recorded, never silent. */
   private readonly missing: MissingRange[] = [];
   private rejectedOwnership = 0;
+  private uncontestedOwnership = 0;
   private timeoutPromotions = 0;
   private readonly noTransportFallbackMs: number;
   /** Capture time of the first mixed frame — the fallback's wait is measured from it. */
@@ -531,6 +539,7 @@ export class TeamsCsrcGmeetPipeline {
       openSources: this.manager.getActiveSpeakers().length,
       inFlight: this.inflight.size,
       rejectedOwnership: this.rejectedOwnership,
+      uncontestedOwnership: this.uncontestedOwnership,
       timeoutPromotions: this.timeoutPromotions,
       contestedPairs: this.contests.size,
       noTransportFallback: this.fallbackActive,
@@ -645,20 +654,44 @@ export class TeamsCsrcGmeetPipeline {
       this.ownershipSlackMs,
       this.onsetGapMs,
     )) {
-      this.rejectedOwnership++;
-      this.options.onRejectedOwnership?.(
-        { csrc, speaker: this.trackNamer.labelFor(String(csrc)), sourceKey, segmentId, text, startMs, endMs: boundedEndMs, completed, language },
-        (this.ownership.get(csrc) ?? []).map((interval) => ({ ...interval })),
-      );
-      // Clear an ordinary draft under the same public key if the confirmed replacement is refused.
-      // A timeout-promoted durable row must survive a refused extension.
-      if (!this.promotedDraftIds.has(segmentId)) {
-        this.emit({ csrc, speaker: this.trackNamer.labelFor(String(csrc)), sourceKey, segmentId, text: '', startMs, endMs: startMs, completed: false, language });
+      const segment = { csrc, speaker: this.trackNamer.labelFor(String(csrc)), sourceKey, segmentId, text, startMs, endMs: boundedEndMs, completed, language };
+      const intervals = (this.ownership.get(csrc) ?? []).map((interval) => ({ ...interval }));
+      if (this.routedToAnotherLane(csrc, startMs, boundedEndMs)) {
+        this.rejectedOwnership++;
+        this.options.onRejectedOwnership?.(segment, intervals);
+        // Clear an ordinary draft under the same public key if the confirmed replacement is refused.
+        // A timeout-promoted durable row must survive a refused extension.
+        if (!this.promotedDraftIds.has(segmentId)) {
+          this.emit({ ...segment, text: '', endMs: startMs, completed: false });
+        }
+        return false;
       }
-      return false;
+      // Every frame of this segment was routed to this lane alone, so no other speaker can own
+      // it: the misfit is a disagreement between the capture clock (frame stamps) and the
+      // transport clock (CSRC edges), not a second voice. Publish, and report the disagreement.
+      this.uncontestedOwnership++;
+      try {
+        this.options.onUncontestedOwnership?.(segment, this.ownershipOffsetMs(intervals, startMs), intervals);
+      } catch { /* diagnostics never break the transcript lane */ }
     }
     this.emit({ csrc, speaker: this.trackNamer.labelFor(String(csrc)), sourceKey, segmentId, text, startMs, endMs: boundedEndMs, completed, language });
     return true;
+  }
+
+  /** Was any audio in [startMs, endMs] (capture clock) also routed to a lane other than `csrc`? */
+  private routedToAnotherLane(csrc: number, startMs: number, endMs: number): boolean {
+    return this.routedSpans.some((span) => span.csrc !== csrc && span.startMs <= endMs && span.endMs >= startMs);
+  }
+
+  /** How far `startMs` sits before the nearest ownership interval's start (ms; negative: after). */
+  private ownershipOffsetMs(intervals: CsrcOwnershipInterval[], startMs: number): number {
+    let offset = 0;
+    let best = Number.POSITIVE_INFINITY;
+    for (const interval of intervals) {
+      const distance = Math.abs(interval.startMs - startMs);
+      if (distance < best) { best = distance; offset = interval.startMs - startMs; }
+    }
+    return offset;
   }
 
   private emit(segment: TeamsCsrcTranscriptSegment): void {

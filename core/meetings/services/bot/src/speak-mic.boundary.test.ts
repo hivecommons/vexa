@@ -10,6 +10,11 @@
  *   6. No readable control: the line is refused, never played blind.
  *   7. Concurrent lines play strictly one after another, each reporting its durationMs.
  *   8. speak_stop drops every line still queued.
+ *   9. prepare() opens the mic when the bot is admitted, so the first line toggles nothing and its
+ *      mic check is one read (milliseconds); a control drawn late is waited for.
+ *  10. A toggle is confirmed as soon as the control reads open, not after a fixed wait.
+ *  11. The line's timing (queue, mic, first audio, synthesis, cached) is reported; idle() resolves
+ *      once the queue is empty.
  *
  * Where headless Chromium cannot launch the test SKIPs (exit 0), like the other boundary tests.
  */
@@ -125,6 +130,74 @@ async function main(): Promise<void> {
     const [f, g] = await Promise.all([first, second]);
     check('speak_stop drops the queued line', (g as any).reason === 'stopped' && !order.includes('start:second'),
       JSON.stringify({ f, g, order }));
+
+    // prepare(): the mic is opened at join, and the first line then only reads it.
+    await page.setContent(micPage({ muted: 'Turn on microphone (ctrl + d)', unmuted: 'Turn off microphone (ctrl + d)', startMuted: true }));
+    const stats = { synthMs: 12, cached: false };
+    const timedTts = {
+      spoken: [] as string[],
+      async speak(text: string, _voice?: string, hooks?: { onFirstAudio?: () => void; onLine?: (s: { synthMs: number; cached: boolean }) => void }): Promise<number> {
+        await new Promise((r) => setTimeout(r, 30));
+        hooks?.onFirstAudio?.();
+        await new Promise((r) => setTimeout(r, 60));
+        hooks?.onLine?.(stats);
+        this.spoken.push(text);
+        return 60;
+      },
+      stop() { /* */ },
+    };
+    const joined = createSpeakController(page, inv('google_meet'), timedTts);
+    await joined.prepare();
+    const afterPrepare = await page.evaluate(() => ({
+      clicks: (globalThis as any).__clicks,
+      label: (globalThis as any).document.querySelector('button')?.getAttribute('aria-label'),
+    }));
+    check('prepare opens the mic once at join', afterPrepare.clicks === 1 && /turn off/i.test(afterPrepare.label), JSON.stringify(afterPrepare));
+    let firstAudio = -1;
+    const line = await joined.speak('hello room', undefined, { onFirstAudio: (ms) => { firstAudio = ms; } });
+    const clicksAfterLine = await page.evaluate(() => (globalThis as any).__clicks);
+    const t = (line as any).timing;
+    check('the first line after prepare toggles nothing', line.spoken === true && clicksAfterLine === 1, JSON.stringify({ line, clicksAfterLine }));
+    check('its mic check is one read: tens of milliseconds at most', t && t.micMs < 100, JSON.stringify(t));
+    check('the line reports where its time went (queue, mic, first audio, synthesis, cached)',
+      t && t.queueMs < 50 && t.firstAudioMs >= 30 && t.firstAudioMs < t.totalMs && t.synthMs === 12 && t.cached === false && firstAudio === t.firstAudioMs,
+      JSON.stringify({ t, firstAudio }));
+
+    // A toggle is confirmed as soon as the control reads open.
+    await page.setContent(micPage({ id: 'microphone-button', muted: 'Unmute mic', unmuted: 'Mute mic', startMuted: true }));
+    const quick = await createSpeakController(page, inv('teams'), timedTts).speak('hello room');
+    check('a toggle that takes effect at once is not waited on for the full settle time',
+      quick.spoken === true && (quick as any).timing.micMs < 300, JSON.stringify((quick as any).timing));
+
+    // A control drawn after admission is waited for by prepare().
+    await page.setContent('<!doctype html><html><body><p>joining</p></body></html>');
+    const late = createSpeakController(page, inv('teams'), timedTts);
+    const preparing = late.prepare();
+    await new Promise((r) => setTimeout(r, 200));
+    await page.setContent(micPage({ id: 'microphone-button', muted: 'Unmute mic', unmuted: 'Mute mic', startMuted: true }));
+    await preparing;
+    const lateLabel = await page.evaluate(() => (globalThis as any).document.querySelector('button')?.getAttribute('aria-label'));
+    check('prepare waits for a mic control drawn after admission, then opens it', lateLabel === 'Mute mic', String(lateLabel));
+
+    // A line that arrives while prepare() is still looking for the control does not wait for it.
+    await page.setContent('<!doctype html><html><body><p>joining</p></body></html>');
+    const busy = createSpeakController(page, inv('teams'), timedTts);
+    const looking = busy.prepare();
+    const t0 = Date.now();
+    const refused = await busy.speak('too early');
+    check('a line never waits on the join-time mic search', Date.now() - t0 < 3000 && refused.spoken === false, `${Date.now() - t0} ms`);
+    await looking;
+    await page.setContent(micPage({ id: 'microphone-button', muted: 'Unmute mic', unmuted: 'Mute mic', startMuted: false }));
+
+    // idle(): resolves once nothing is playing or queued.
+    const before = timedTts.spoken.length;
+    void late.speak('one'); void late.speak('two');
+    await late.idle();
+    check('idle resolves once every queued line has played', timedTts.spoken.length === before + 2, String(timedTts.spoken.length - before));
+    const disabled = createSpeakController(page, { platform: 'teams', voiceAgentEnabled: false } as unknown as Invocation, timedTts);
+    await disabled.prepare(); await disabled.idle();
+    const disabledClicks = await page.evaluate(() => (globalThis as any).__clicks);
+    check('a bot that cannot speak never touches the mic at join', disabledClicks === 0, String(disabledClicks));
   } finally {
     await context!.close().catch(() => undefined);
     rmSync(dataDir, { recursive: true, force: true });

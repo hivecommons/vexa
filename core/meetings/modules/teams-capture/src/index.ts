@@ -62,8 +62,11 @@ export {
   findTeamsChatComposer,
   findTeamsChatSendButton,
   countTeamsChatLines,
+  teamsChatWireText,
+  teamsComposerHolds,
+  markedTeamsComposerHolds,
 } from './teams-chat.js';
-export type { TeamsChat, TeamsChatMessage, TeamsChatSendResult, TeamsChatSendFailure } from './teams-chat.js';
+export type { TeamsChat, TeamsChatMessage, TeamsChatSendResult, TeamsChatSendFailure, TeamsChatSendStep } from './teams-chat.js';
 export { createTeamsCaptions, teamsCaptionSelectors } from './msteams-captions.js';
 export type {
   TeamsCaptions,

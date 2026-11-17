@@ -70,9 +70,10 @@ export function createGmeetCaptureV1(opts: GmeetCaptureV1Options): GmeetCaptureV
   const capture = createGmeetCapture({
     ...opts.capture,
     log: opts.log,
-    onAudio: (index, pcm) => {
+    now,
+    onAudio: (index, pcm, meta) => {
       const speakerName = pickBoundName(speakers.litNames());
-      opts.sink.audioChunk({ speakerId: `spk-${index}`, speakerIndex: index, samples: pcm, ts: now(), speakerName });
+      opts.sink.audioChunk({ speakerId: `spk-${index}`, speakerIndex: index, samples: pcm, ts: meta.tsMs, speakerName });
     },
   });
 

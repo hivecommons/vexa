@@ -9,7 +9,9 @@
  */
 export { createPcmCaptureNode, WORKLET_SRC, PCM_WORKLET_PROCESSOR } from "./pcm-capture.js";
 export { createGmeetCapture } from "./gmeet-capture.js";
-export type { GmeetCapture } from "./gmeet-capture.js";
+export type { GmeetCapture, GmeetAudioMeta } from "./gmeet-capture.js";
+export { createSpeechWindow, blockPeak } from "./speech-window.js";
+export type { SpeechWindow, SpeechWindowBlock, SpeechWindowOptions } from "./speech-window.js";
 export { createGmeetSpeakers } from "./gmeet-speakers.js";
 export type { GmeetSpeakers } from "./gmeet-speakers.js";
 export { createGmeetCaptureV1, pickBoundName } from "./gmeet-capture-v1.js";

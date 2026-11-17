@@ -316,6 +316,7 @@ async function main(): Promise<void> {
         recordCaption: (name: string) => calls.push(`caption:${name}`),
         recordRosterName: (name: string) => calls.push(`roster:${name}`),
         recordRosterCoverage: (named: number, participants: number) => calls.push(`coverage:${named}/${participants}`),
+        health: () => ({ inputFrames: 12, emittedFrames: 9, active: 1, turns: 2, rejectedOwnership: 3, uncontestedOwnership: 4 }) as any,
         async dispose() { disposed = true; },
       };
     };
@@ -366,6 +367,24 @@ async function main(): Promise<void> {
       `${JSON.stringify(named)} ${ajv.errorsText(validateSeg.errors)}`);
     check('Teams cleared draft retracts its exact durable id',
       sink.retracted.includes('csrc-840:1:2000'), JSON.stringify(sink.retracted));
+    check('Teams lane reports what it routed, published and refused for the audio-diag line',
+      pipe.laneDiag?.() === 'lane-frames-in=12 lane-frames-routed=9 csrc-active=1 turns=2 drafts=1 finals=1 retracts=1 refused-ownership=3 clock-offset-finals=4',
+      String(pipe.laneDiag?.()));
+    check('Teams lane hands the shared window a logger (filtered and silent passes leave a trace)',
+      typeof options!.buffer?.logger === 'function');
+    {
+      const warned: string[] = [];
+      const origWarn = console.warn;
+      console.warn = (m: string) => { warned.push(String(m)); };
+      try {
+        const seg = { csrc: 201, speaker: 'Alice', sourceKey: 'csrc-201:1', segmentId: 'x', text: 'hello', startMs: 1_000, endMs: 2_000, completed: true };
+        options!.onUncontestedOwnership?.(seg, 2_500, [{ startMs: 3_500 }]);
+        options!.onRejectedOwnership?.(seg, [{ startMs: 3_500 }]);
+      } finally { console.warn = origWarn; }
+      check('Teams lane logs a clock-offset final and a refused final, each on its own line',
+        warned.length === 2 && warned[0].includes('2500ms before the transport clock') && warned[1].includes('REFUSED'),
+        JSON.stringify(warned));
+    }
     await pipe.stop();
     check('Teams stop flushes/disposes the CSRC/GMeet lane', disposed);
   }
@@ -469,14 +488,16 @@ async function main(): Promise<void> {
   }
 
   // ── 9b) SHOW FAST, THEN RECONFIRM is on by default: the lane's confirmed window goes out as a draft
-  //       first, then ONE reconfirmed segment (a second request over the same audio) replaces it.
+  //       first, then ONE confirmed segment replaces it under the same id. A turn transcribed whole
+  //       in one final window is confirmed by that answer (the same audio is not sent twice); a turn
+  //       with several drafts is transcribed again in one request (gmeet-pipeline reconfirm.test.ts).
   {
     const ZF = 4096, ZF_MS = (ZF / SR) * 1000;
     const zframe = new Float32Array(ZF).fill(0.05);
     let n = 0;
     const transcribe = async (pcm: Float32Array): Promise<TranscriptionResult> => {
       n++;
-      const text = n === 1 ? 'first version…' : 'the reconfirmed sentence.';
+      const text = n === 1 ? 'the whole turn in one window.' : 'a second request that must not happen.';
       return { text, language: 'en', duration: pcm.length / SR, segments: [{ start: 0, end: pcm.length / SR, text }] };
     };
     const sink = captureSink();
@@ -485,11 +506,12 @@ async function main(): Promise<void> {
     let t = 1_800_000_000_000;
     for (let k = 0; k < 12; k++) { pipe.feedAudio(4, 'Alice', zframe, t); t += ZF_MS; }
     await pipe.stop();
-    const first = sink.published.find((s) => s.text === 'first version…');
+    const first = sink.published.find((s) => s.text === 'the whole turn in one window.');
     const final = sink.published.filter((s) => s.completed);
     check('reconfirm (default): the first version is shown as a draft', !!first && first.completed === false, JSON.stringify(sink.published));
-    check('reconfirm (default): the reconfirmed text replaces it under the same id, and is the only confirmed text',
-      final.length === 1 && final[0].text === 'the reconfirmed sentence.' && final[0].segment_id === first?.segment_id, JSON.stringify(final));
+    check('reconfirm (default): one final window is confirmed under the same id by its own answer, with one STT request',
+      final.length === 1 && final[0].text === 'the whole turn in one window.' && final[0].segment_id === first?.segment_id && n === 1,
+      JSON.stringify({ final, requests: n }));
     check('per-track turn gap is 2 s for zoom; google_meet keeps the lane default',
       perChannelOnsetGapMs('zoom') === PER_TRACK_ONSET_GAP_MS && PER_TRACK_ONSET_GAP_MS === 2000 && perChannelOnsetGapMs('google_meet') === undefined);
   }

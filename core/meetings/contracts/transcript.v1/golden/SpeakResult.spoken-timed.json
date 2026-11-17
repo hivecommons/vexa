@@ -1,0 +1,1 @@
+{ "type": "speak_result", "meeting_id": 42, "id": "0f1e2d3c4b5a69788796a5b4c3d2e1f0", "status": "spoken", "duration_ms": 2340, "queue_ms": 0, "mic_ms": 6, "first_audio_ms": 412, "synth_ms": 398, "cached": false }

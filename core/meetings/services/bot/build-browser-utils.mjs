@@ -100,6 +100,7 @@ import {
   sendTeamsChatMessage,
   prepareTeamsChatSend,
   awaitTeamsChatLanded,
+  markedTeamsComposerHolds,
 } from ${JSON.stringify(TEAMS)};
 import {
   createZoomSpeakers,
@@ -138,6 +139,7 @@ const VexaBrowserUtils = {
   sendTeamsChatMessage,      // capture-bridge.ts createChatSender: acts.v1 chat_send on teams (page-side fallback)
   prepareTeamsChatSend,      // capture-bridge.ts createChatSender: marks composer + send for trusted input
   awaitTeamsChatLanded,      // capture-bridge.ts createChatSender: the trusted send's landing check
+  markedTeamsComposerHolds,  // capture-bridge.ts createChatSender: the trusted send's "did the text go in" check
   // ── zoom lane (active-speaker DOM watcher → 'dom-active' naming hints) ──
   createZoomSpeakers,        // capture-bridge.ts: w.VexaBrowserUtils.createZoomSpeakers
   createTrackNameResolver,   // capture-bridge.ts setupPerTrack: the pure channel↔name correlator

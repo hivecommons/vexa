@@ -10,6 +10,9 @@
  *   - no composer → no_composer; blank text → empty_text, the page untouched;
  *   - the trusted path's marks land on the composer and the send button, and stale marks are cleared;
  *   - the composer wait outlasts a control bar that mounts late, and gives up only after its budget;
+ *   - a composer mounted in a closed panel (in the DOM, no box) is not used: the toggle opens the
+ *     panel; a composer that takes no text fails as composer_empty with send not pressed; each
+ *     failure names its step; line breaks go in as spaces;
  *   - the reader (keepOpen) opens the panel, delivers participant lines with one log line each,
  *     skips the bot's own lines, and re-opens a panel that closed.
  * The live Teams DOM is validated live.
@@ -22,6 +25,9 @@ import {
   prepareTeamsChatSend,
   awaitTeamsChatLanded,
   countTeamsChatLines,
+  teamsChatWireText,
+  teamsComposerHolds,
+  markedTeamsComposerHolds,
   TEAMS_CHAT_COMPOSER_MARK,
   TEAMS_CHAT_SEND_MARK,
 } from './teams-chat.js';
@@ -261,7 +267,7 @@ const logFn = (m: string) => log.push(m);
   const r = await sendTeamsChatMessage('never', { log: (m) => lines.push(m), waitMs: WAIT_MS, landWaitMs: 50 });
   check('bounded wait: no_composer', !r.ok && r.reason === 'no_composer', JSON.stringify(r));
   check('bounded wait: it waited the budget before giving up', Date.now() - t0 >= WAIT_MS, String(Date.now() - t0));
-  check('bounded wait: the failure log names the toggle it saw', lines.some((l) => /no composer after \d+ ms \(toggle via #chat-button/.test(l)), JSON.stringify(lines));
+  check('bounded wait: the failure log names the toggle it saw', lines.some((l) => /no composer after \d+ ms, step=panel_not_opened \(toggle via #chat-button, pressed/.test(l)), JSON.stringify(lines));
 }
 
 // 12. prepare (the trusted path) waits for a late composer the same way.
@@ -327,6 +333,112 @@ const logFn = (m: string) => log.push(m);
   reader.destroy();
   Date.now = realNow;
 }
+
+// 14. Teams keeps the chat pane mounted while the panel is closed: the composer is in the DOM with
+//     no box. It is not used; the toggle opens the panel and the send goes into the shown composer.
+{
+  const f = fixture({ open: true });
+  let shown = false;
+  (f.composer as any).getBoundingClientRect = () => (shown ? { width: 300, height: 40 } : { width: 0, height: 0 });
+  f.toggle.onclick = () => { shown = true; };
+  const p = await prepareTeamsChatSend('hidden first', { waitMs: 500 });
+  check('mounted but not rendered: the toggle is clicked once to show the panel', f.toggle.clicks === 1, String(f.toggle.clicks));
+  check('mounted but not rendered: the composer is used once it has a box', p.composer !== null && f.composer.hasAttribute(TEAMS_CHAT_COMPOSER_MARK), JSON.stringify(p));
+  const again = await prepareTeamsChatSend('already open', { waitMs: 200 });
+  check('idempotent: a shown composer is found without touching the toggle again', again.composer !== null && f.toggle.clicks === 1, String(f.toggle.clicks));
+}
+
+// 15. The same pane with no toggle anywhere: composer_hidden, and the log lists the page's buttons.
+{
+  const f = fixture({ open: true });
+  f.toggle.parentElement!.kids = [new FakeEl('button', { id: 'hangup-button', 'aria-label': 'Leave' })];
+  (f.composer as any).getBoundingClientRect = () => ({ width: 0, height: 0 });
+  const lines: string[] = [];
+  const r = await sendTeamsChatMessage('nobody home', { log: (m) => lines.push(m), waitMs: 120, landWaitMs: 30 });
+  check('hidden composer, no toggle: no_composer at step composer_hidden', !r.ok && r.reason === 'no_composer' && r.step === 'composer_hidden', JSON.stringify(r));
+  check('hidden composer, no toggle: the log names the hidden composer and the buttons it saw',
+    lines.some((l) => l.includes('step=composer_hidden') && l.includes('[data-tid="ckeditor"]')) && lines.some((l) => l.includes('hangup-button||Leave')),
+    JSON.stringify(lines));
+  check('hidden composer: nothing was typed or sent', !f.composer.focused && f.send.clicks === 0);
+}
+
+// 16. Each no_composer failure names its step.
+{
+  doc.root = new FakeEl('html');
+  const none = await sendTeamsChatMessage('x', { waitMs: 40, landWaitMs: 30 });
+  check('no toggle, no composer: step toggle_absent', !none.ok && none.step === 'toggle_absent', JSON.stringify(none));
+  const f = fixture({ open: false });
+  f.toggle.onclick = () => { /* the click opens nothing */ };
+  const stuck = await prepareTeamsChatSend('x', { waitMs: 150 });
+  check('toggle clicked, no composer: step panel_not_opened', stuck.composer === null && stuck.step === 'panel_not_opened', JSON.stringify(stuck));
+}
+
+// 17. An editor that takes no text: composer_empty, and send is NOT pressed (it would post nothing).
+{
+  const f = fixture({ open: true });
+  doc.execCommandWorks = false;
+  Object.defineProperty(f.composer, 'textContent', { get: () => '', set: () => { /* the editor drops it */ } });
+  const lines: string[] = [];
+  const r = await sendTeamsChatMessage('into the void', { log: (m) => lines.push(m), landWaitMs: 30 });
+  doc.execCommandWorks = true;
+  check('editor took no text: not_landed at step composer_empty', !r.ok && r.reason === 'not_landed' && r.step === 'composer_empty', JSON.stringify(r));
+  check('editor took no text: send was not pressed', f.send.clicks === 0 && !f.composer.events.some((e) => e.key === 'Enter'));
+  check('editor took no text: the log says so', lines.some((l) => l.includes('step=composer_empty')), JSON.stringify(lines));
+}
+
+// 18. The text is in, send is pressed, the list never shows it: step not_in_list.
+{
+  fixture({ open: true, renders: false });
+  const r = await sendTeamsChatMessage('lost after send', { landWaitMs: 30 });
+  check('pressed send, never listed: step not_in_list', !r.ok && r.reason === 'not_landed' && r.step === 'not_in_list', JSON.stringify(r));
+}
+
+// 19. A long, multi-line line goes in whole as one paragraph (Enter would send it early).
+{
+  const f = fixture({ open: true });
+  const long = `Hi, I'm Betty Bee from the hive.\nI take notes, keep this meeting's transcript, and answer questions from what the hive knows: `
+    + `its knowledge base and work items.\r\n\r\nSay my name to ask me something. Say "betty leave" and I'll buzz off.`;
+  const wire = teamsChatWireText(long);
+  check('wire text: line breaks become single spaces, nothing else changes',
+    !/[\r\n]/.test(wire) && wire.length === long.replace(/\s*[\r\n]+\s*/g, ' ').length && wire.includes('hive. I take') && wire.includes('items. Say my'));
+  const r = await sendTeamsChatMessage(long, { landWaitMs: 50 });
+  check('long multi-line line: inserted once, as one paragraph', JSON.stringify(doc.inserted) === JSON.stringify([wire]), JSON.stringify(doc.inserted));
+  check('long multi-line line: lands (the list is compared whitespace-normalized)', r.ok === true, JSON.stringify(r));
+  check('holds: the composer check is whitespace-normalized and false for an empty editor',
+    teamsComposerHolds(f.composer as any, long) && !teamsComposerHolds(new FakeEl('div') as any, long) && !teamsComposerHolds(f.composer as any, '  '));
+}
+
+// 20. The trusted path's "did the text go in" check reads the marked composer.
+{
+  const f = fixture({ open: true });
+  await prepareTeamsChatSend('typed by playwright', {});
+  check('marked composer: empty before typing', !markedTeamsComposerHolds('typed by playwright'));
+  f.composer.textContent = 'typed by playwright';
+  check('marked composer: holds the text after typing', markedTeamsComposerHolds('typed by playwright'));
+  f.composer.removeAttribute(TEAMS_CHAT_COMPOSER_MARK);
+  check('marked composer: false once the mark is gone', !markedTeamsComposerHolds('typed by playwright'));
+}
+
+// 21. Reading does not depend on sending: with every send failing (an editor that takes no text),
+//     a participant's "betty leave" is still delivered.
+{
+  const f = fixture({ open: true });
+  doc.execCommandWorks = false;
+  Object.defineProperty(f.composer, 'textContent', { get: () => '', set: () => { /* dropped */ } });
+  const got: string[] = [];
+  const observers: Array<() => void> = [];
+  (globalThis as any).MutationObserver = class { constructor(private cb: () => void) {} observe() { observers.push(this.cb); } disconnect() { /* */ } };
+  (globalThis as any).window = { setInterval: () => 1, clearInterval: () => { /* */ } };
+  const reader = createTeamsChat({ onMessage: (m) => got.push(`${m.sender}: ${m.text}`), selfName: 'Vexa Bot', keepOpen: true });
+  const r = await sendTeamsChatMessage('an answer that cannot be typed', { landWaitMs: 30 });
+  f.list.append(message('Andy Anderson', 'betty leave'));
+  observers.forEach((cb) => cb());
+  reader.destroy();
+  doc.execCommandWorks = true;
+  check('reader with a broken sender: the send failed', !r.ok, JSON.stringify(r));
+  check('reader with a broken sender: "betty leave" is still delivered', got.includes('Andy Anderson: betty leave'), JSON.stringify(got));
+}
+
 
 console.log(failed ? `\n❌ ${failed} check(s) failed` : '\n✅ teams-chat-send: all checks passed');
 process.exit(failed ? 1 : 0);

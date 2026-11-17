@@ -98,6 +98,11 @@
         "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
         "status": { "enum": ["speaking", "spoken", "failed"] },
         "duration_ms": { "type": "integer", "minimum": 0 },
+        "queue_ms": { "type": "integer", "minimum": 0, "description": "On `spoken`: ms the line waited behind earlier lines, from the moment the bot took the act." },
+        "mic_ms": { "type": "integer", "minimum": 0, "description": "On `spoken`: ms spent reading (and, when shut, opening) the meeting mic." },
+        "first_audio_ms": { "type": "integer", "minimum": 0, "description": "On `spoken`: ms from the moment the bot took the act to the first PCM handed to the player." },
+        "synth_ms": { "type": "integer", "minimum": 0, "description": "On `spoken`: ms spent waiting on the TTS service before the first audio; 0 when the first sentence came from the clip cache." },
+        "cached": { "type": "boolean", "description": "On `spoken`: every sentence of the line came from the bot's clip cache." },
         "reason": { "enum": ["voice_disabled", "mic_muted", "tts_failed", "stopped"] }
       },
       "allOf": [

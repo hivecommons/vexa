@@ -7,7 +7,10 @@ nothing received the act. The bot reports the line on its signed ``transcription
 as ``speak_result`` entries; the collector settles the record from them (``settle``):
 
   * ``speaking`` — the mic was confirmed open and the line started playing;
-  * ``spoken`` with ``duration_ms`` — playback ended; the milliseconds of audio actually played;
+  * ``spoken`` with ``duration_ms``: playback ended; the milliseconds of audio actually played.
+    It may also say where the line's time went (``SPEAK_TIMING_FIELDS``): ``first_audio_ms`` from
+    the bot taking the act to the first audio, ``synth_ms`` of that waiting on the TTS service,
+    ``queue_ms`` behind earlier lines, ``mic_ms`` on the meeting mic, and ``cached``;
   * ``failed`` with the bot's ``SpeakFailure`` reason (``mic_muted``: the meeting mic could not be
     confirmed open, so nothing was played).
 
@@ -27,6 +30,7 @@ else in this process.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 from .chat_delivery import REQUEST_ID_FORM, ChatDeliveryLedger
@@ -41,6 +45,57 @@ SPEAK_UNCONFIRMED_AFTER_SEC = 120
 #: The reasons a bot reports a line as not spoken (``services/bot`` ``SpeakFailure``). A failure
 #: naming anything else is recorded as ``failed`` with reason ``unknown``.
 SPEAK_FAILURES = frozenset({"voice_disabled", "mic_muted", "tts_failed", "stopped"})
+
+#: What a ``spoken`` report may say about where the line's time went: whole milliseconds, measured
+#: by the bot from the moment it took the act. Anything else, or a value of another type, is dropped.
+SPEAK_TIMING_FIELDS = ("queue_ms", "mic_ms", "first_audio_ms", "synth_ms")
+
+#: A timing above this (ten minutes) is not a measurement of one line and is dropped.
+SPEAK_TIMING_MAX_MS = 600_000
+
+
+def speak_timing(report: Any) -> dict:
+    """The timing fields of a bot's ``spoken`` report that are well formed: the ``SPEAK_TIMING_FIELDS``
+    as non-negative whole milliseconds, and ``cached`` as a boolean."""
+    if not isinstance(report, dict):
+        return {}
+    timing: dict = {}
+    for field in SPEAK_TIMING_FIELDS:
+        value = report.get(field)
+        if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= SPEAK_TIMING_MAX_MS:
+            timing[field] = value
+    if isinstance(report.get("cached"), bool):
+        timing["cached"] = report["cached"]
+    return timing
+
+
+def _iso(epoch: Any) -> Optional[str]:
+    """An epoch-seconds stamp as ISO 8601 UTC with milliseconds, or ``None``."""
+    if not isinstance(epoch, (int, float)) or isinstance(epoch, bool):
+        return None
+    return datetime.fromtimestamp(float(epoch), tz=timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def speak_timeline(record: dict) -> dict:
+    """When a line was queued, started, first heard and finished, for the status read.
+
+    ``queued_at`` is the send; ``speaking_at`` and ``spoken_at`` are when the bot's reports were
+    applied here; ``first_audio_at`` is the send plus the bot's own ``first_audio_ms`` (the act
+    reaches the bot within milliseconds of the send, so the bot's clock offset does not enter).
+    The bot's timing fields are passed through as it reported them. Only what is known is present."""
+    out: dict = {}
+    created = record.get("created")
+    for name, stamp in (("queued_at", created), ("speaking_at", record.get("started")),
+                        ("spoken_at", record.get("settled") if record.get("status") == "spoken" else None)):
+        iso = _iso(stamp)
+        if iso:
+            out[name] = iso
+    timing = speak_timing(record.get("timing"))
+    out.update(timing)
+    if "first_audio_ms" in timing and isinstance(created, (int, float)):
+        out["first_audio_at"] = _iso(float(created) + timing["first_audio_ms"] / 1000.0)
+    return out
+
 
 #: The statuses a bot may report, and the ones each may follow.
 _ALLOWED_FROM = {
@@ -92,10 +147,12 @@ class SpeakDeliveryLedger(ChatDeliveryLedger):
             self._local.pop(key, None)
 
     async def settle(self, request_id: str, *, meeting_id: int, status: str,  # type: ignore[override]
-                     duration_ms: Optional[int] = None, reason: Optional[str] = None) -> bool:
+                     duration_ms: Optional[int] = None, reason: Optional[str] = None,
+                     timing: Optional[dict] = None) -> bool:
         """Apply one bot report to a record of ``meeting_id``. Returns whether the record changed: an
         unknown, expired or terminal record, one of another meeting, a backward move, or a ``spoken``
-        without a duration is left as it is."""
+        without a duration is left as it is. ``timing`` (a ``spoken`` report's ``SPEAK_TIMING_FIELDS``
+        and ``cached``) is kept with the record when well formed."""
         if not isinstance(request_id, str) or not REQUEST_ID_FORM.fullmatch(request_id):
             return False
         allowed = _ALLOWED_FROM.get(status)
@@ -113,6 +170,9 @@ class SpeakDeliveryLedger(ChatDeliveryLedger):
         record["status"] = status
         if status == "spoken":
             record["duration_ms"] = int(duration_ms)  # type: ignore[arg-type]
+            kept = speak_timing(timing)
+            if kept:
+                record["timing"] = kept
         if status == "failed":
             record["reason"] = reason if reason in SPEAK_FAILURES else "unknown"
         if status in ("spoken", "failed"):

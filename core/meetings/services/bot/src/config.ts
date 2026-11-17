@@ -194,6 +194,8 @@ const SPEAKER_STREAM_ENV: Array<[Exclude<keyof SpeakerStreamManagerConfig, 'call
   ['maxBufferDuration', 'BOT_SPEAKER_MAX_BUFFER_SEC'],
   ['idleTimeoutSec', 'BOT_SPEAKER_IDLE_TIMEOUT_SEC'],
   ['minFinalAudioSec', 'BOT_SPEAKER_MIN_FINAL_AUDIO_SEC'],
+  // End of utterance: quiet (ms) after speech that sends the window as a final. Profile default 500.
+  ['pauseFinalMs', 'BOT_SPEAKER_PAUSE_FINAL_MS'],
 ];
 
 /** Per-request STT timeout (ms) from `BOT_STT_TIMEOUT_SEC`, or undefined for the client default
@@ -222,6 +224,35 @@ export function reconfirmSecFromEnv(env: NodeJS.ProcessEnv = process.env): numbe
   if (raw === '') return DEFAULT_RECONFIRM_SEC;
   const v = Number(raw);
   return Number.isFinite(v) && v >= 0 ? Math.min(v, 30) : DEFAULT_RECONFIRM_SEC;
+}
+
+/** When a speaker's drafts are replaced by their confirmed segment: after this much quiet (ms) since
+ *  their last speech (`BOT_TRANSCRIPT_RECONFIRM_QUIET_MS`, default 1000), or this long (ms) after
+ *  their last draft while speech goes on (`BOT_TRANSCRIPT_RECONFIRM_IDLE_MS`, default 1500). The
+ *  quiet value is what a consumer waiting for a completed segment experiences as the end of turn:
+ *  lower is faster, and splits a sentence at a shorter pause. Unset or invalid → the default. */
+export const DEFAULT_RECONFIRM_QUIET_MS = 1000;
+export const DEFAULT_RECONFIRM_IDLE_MS = 1500;
+const RECONFIRM_WAIT_MIN_MS = 200;
+const RECONFIRM_WAIT_MAX_MS = 10_000;
+function reconfirmWaitMs(raw: string | undefined, fallback: number): number {
+  const v = Number((raw ?? '').trim());
+  return (raw ?? '').trim() !== '' && Number.isFinite(v) && v >= RECONFIRM_WAIT_MIN_MS ? Math.min(v, RECONFIRM_WAIT_MAX_MS) : fallback;
+}
+export function reconfirmQuietMsFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  return reconfirmWaitMs(env.BOT_TRANSCRIPT_RECONFIRM_QUIET_MS, DEFAULT_RECONFIRM_QUIET_MS);
+}
+export function reconfirmIdleMsFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  return reconfirmWaitMs(env.BOT_TRANSCRIPT_RECONFIRM_IDLE_MS, DEFAULT_RECONFIRM_IDLE_MS);
+}
+
+/** What every transcription request is biased with: `BOT_STT_HOTWORDS` (names and domain words the
+ *  model should prefer, e.g. "Betty, hive queue, pull request") and `BOT_STT_PROMPT` (a fixed
+ *  opening for the request's prompt). Unset → nothing is sent. */
+export function sttBiasFromEnv(env: NodeJS.ProcessEnv = process.env): { hotwords?: string; initialPrompt?: string } {
+  const hotwords = (env.BOT_STT_HOTWORDS ?? '').trim();
+  const initialPrompt = (env.BOT_STT_PROMPT ?? '').trim();
+  return { ...(hotwords ? { hotwords } : {}), ...(initialPrompt ? { initialPrompt } : {}) };
 }
 
 /** The lane tuning. ONE pipeline by default — show fast, then reconfirm: a pause of 500–700 ms ends

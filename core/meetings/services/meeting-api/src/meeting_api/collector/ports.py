@@ -571,7 +571,9 @@ class RedisBus(Protocol):
     async def settle_speak(
         self, request_id: str, *, meeting_id: int, status: str,
         duration_ms: Optional[int] = None, reason: Optional[str] = None,
+        timing: Optional[dict] = None,
     ) -> bool:
         """Apply a bot's ``speak_result`` to the spoken line it names (``speak_delivery.py``): only a
-        forward move of a line sent into ``meeting_id`` changes it. Returns whether one did."""
+        forward move of a line sent into ``meeting_id`` changes it. ``timing`` is a ``spoken``
+        report's timing fields. Returns whether one did."""
         ...

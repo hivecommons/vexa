@@ -35,6 +35,7 @@ from typing import Optional
 from . import segment_entry
 from .chat import chat_channel, chat_frame, is_chat
 from .ports import RedisBus, TranscriptStore
+from ..speak_delivery import speak_timing
 
 # Stream / consumer-group defaults (parent ``collector/config.py``).
 STREAM_NAME = "transcription_segments"
@@ -373,7 +374,7 @@ async def ingest(store: TranscriptStore, redis: RedisBus, message: dict) -> int:
         return 0
     if msg_type == "speak_result":
         # The bot's report for one spoken line (`speak_delivery.py`): `speaking`, then `spoken` with
-        # `duration_ms` or `failed` with a reason. It moves only a line sent into the meeting this
+        # `duration_ms` (and where the line's time went) or `failed` with a reason. It moves only a line sent into the meeting this
         # entry's token names, and only forward. Nothing else is persisted or fanned out.
         try:
             meeting_id = int(data.get("meeting_id"))
@@ -388,6 +389,7 @@ async def ingest(store: TranscriptStore, redis: RedisBus, message: dict) -> int:
                 request_id, meeting_id=meeting_id, status=status,
                 duration_ms=duration_ms if isinstance(duration_ms, int) and not isinstance(duration_ms, bool) else None,
                 reason=reason if isinstance(reason, str) else None,
+                timing=speak_timing(data) if status == "spoken" else None,
             )
         except Exception as e:  # noqa: BLE001 — best-effort, like every typed bus message
             _log_publish_failure(meeting_id, e)
