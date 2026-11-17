@@ -1512,7 +1512,8 @@ export interface SpeakController {
 export function createSpeakController(page: Page, inv: Invocation): SpeakController {
   const enabled = !!inv.voiceAgentEnabled;
   const platform = inv.platform;
-  const tts = createTtsPlayback((m) => console.log(`[bot] ${m}`));   // OS-level TTS→tts_sink half
+  // OS-level TTS→tts_sink half. Only a bot that can speak prewarms its stock lines (BOT_TTS_PREWARM).
+  const tts = createTtsPlayback((m) => console.log(`[bot] ${m}`), enabled ? {} : { prewarmLines: [] });
 
   // Toggle the meeting-UI mic button so the bot is audible only while speaking (production
   // unmutes before speech + auto-mutes after — index.ts:1039–1059). The PulseAudio source
