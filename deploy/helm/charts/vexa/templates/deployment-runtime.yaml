@@ -98,6 +98,9 @@ spec:
               value: {{ .Values.runtime.speakerStream.confidenceFilter | default "" | quote }}
             - name: BOT_TRANSCRIPT_RECONFIRM_SEC
               value: {{ .Values.runtime.speakerStream.reconfirmSec | default "" | quote }}
+            # Short lines a voice bot synthesizes ahead of time ("|"-separated; values: runtime.ttsPrewarm).
+            - name: BOT_TTS_PREWARM
+              value: {{ .Values.runtime.ttsPrewarm | default "" | quote }}
             # Google Meet knock policy, forwarded into each new meeting-bot Pod (values: runtime.googleMeetKnock).
             - name: VEXA_GOOGLE_JOIN_MAX_KNOCKS
               value: {{ .Values.runtime.googleMeetKnock.maxKnocks | default "" | quote }}

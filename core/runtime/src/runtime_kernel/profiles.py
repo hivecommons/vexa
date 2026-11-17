@@ -362,6 +362,7 @@ def default_registry() -> ProfileRegistry:
             "BOT_TRANSCRIPTION_LATENCY",
             "BOT_STT_CONFIDENCE_FILTER",
             "BOT_TRANSCRIPT_RECONFIRM_SEC",
+            "BOT_TTS_PREWARM",
             # Google Meet knock policy (2 Nov 2026): Meet refuses a share of anonymous knocks at random;
             # how many knocks, the extra wait between them and the guest-state wipe are deployment
             # settings, so they change without a new bot image (core/meetings/modules/join refusal.ts).

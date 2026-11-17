@@ -753,6 +753,9 @@ runtime:
     confidenceFilter: ""
     # Show fast, then reconfirm (BOT_TRANSCRIPT_RECONFIRM_SEC): "" = 10 s; "0" = off.
     reconfirmSec: ""
+  # BOT_TTS_PREWARM: short lines a voice bot synthesizes ahead of time for each voice it speaks with,
+  # "|"-separated (e.g. an agent's stock acknowledgements), so they play at once. "" = none.
+  ttsPrewarm: ""
   # Active-phase remote-audio silence window. Empty uses the bot's 10-minute default.
   aloneSilenceWindowMs: ""
   # Google Meet refuses some anonymous knocks at random; the bot knocks again on the same page.

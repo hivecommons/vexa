@@ -485,6 +485,17 @@
       ]
     },
     {
+      "key": "BOT_TTS_PREWARM",
+      "class": "defaulted",
+      "default": "(unset \u2014 nothing prewarmed)",
+      "description": "short lines a voice bot synthesizes ahead of time for each voice it speaks with, |-separated (an agent's stock acknowledgements), so they play without a synthesis round trip; forwarded to spawned bots",
+      "targets": [
+        "compose",
+        "helm",
+        "lite"
+      ]
+    },
+    {
       "key": "VEXA_GOOGLE_JOIN_MAX_KNOCKS",
       "class": "defaulted",
       "default": "(unset \u2014 bot default 10)",
