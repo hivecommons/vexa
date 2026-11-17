@@ -70,7 +70,15 @@ export function installRemoteAudioHook(opts: WebRtcAudioHookOptions = {}): boole
       if (!event.track || event.track.kind !== 'audio') return;
       if (win.__vexaMirroredTrackIds.has(event.track.id)) return;   // already mirrored (both track paths fire)
       win.__vexaMirroredTrackIds.add(event.track.id);
-      const stream = (event.streams && event.streams[0]) || new MediaStream([event.track]);
+      // ONE stream per track, always ours. The page's own stream (event.streams[0]) is not a safe
+      // handle: Teams groups several receive tracks under one msid and swaps tracks inside that
+      // MediaStream object as it renegotiates. Mirroring the page's stream meant (a) a later track
+      // that arrived in an already-mirrored stream was never connected (the mixer dedups by stream
+      // id), and (b) createMediaStreamSource binds the stream's FIRST audio track at connect time,
+      // so a stream holding a dead track and a live one could capture the dead one for the whole
+      // meeting: `main-audio-silent` from a bot whose real audio sat in the same stream unused.
+      // A stream we build around this one track keeps stream identity == track identity.
+      const stream = new MediaStream([event.track]);
 
       const audioEl = document.createElement('audio');
       audioEl.autoplay = true;
