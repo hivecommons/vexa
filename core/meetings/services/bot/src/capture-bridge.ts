@@ -1769,7 +1769,7 @@ export function createSpeakController(
     return false;
   };
 
-  const speakOne = async (text: string, voice: string | undefined, hooks: SpeakHooks | undefined, receivedAt: number): Promise<SpeakResult> => {
+  const speakOne = async (text: string, voice: string | undefined, hooks: SpeakHooks | undefined, receivedAt: number, mine: number): Promise<SpeakResult> => {
     const startedAt = Date.now();
     const queueMs = startedAt - receivedAt;
     console.log(`[bot] speak: "${text.slice(0, 60)}"`);
@@ -1794,6 +1794,12 @@ export function createSpeakController(
     } catch (e) {
       console.error(`[bot] speak_failed reason=tts_failed: ${String(e)}`);
       return { spoken: false, reason: 'tts_failed' };
+    }
+    // Zero audio is never "spoken": a stop is reported as stopped, anything else as a TTS failure.
+    if (durationMs <= 0) {
+      const reason: SpeakFailure = mine !== generation ? 'stopped' : 'tts_failed';
+      console.error(`[bot] speak_failed reason=${reason} — no audio was played`);
+      return { spoken: false, reason };
     }
     const timing: SpeakTiming = {
       queueMs, micMs, ...(firstAudioMs !== undefined ? { firstAudioMs } : {}),
@@ -1823,7 +1829,7 @@ export function createSpeakController(
           console.log('[bot] speak: dropped by speak_stop before it played');
           return { spoken: false, reason: 'stopped' };
         }
-        return speakOne(text, voice, hooks, receivedAt);
+        return speakOne(text, voice, hooks, receivedAt, mine);
       }).finally(() => { queued--; });
       tail = run.catch(() => undefined);
       return run;

@@ -5,7 +5,7 @@
  * A span that a second lane was also routed stays refused when it does not fit its CSRC interval.
  * Run: npx tsx src/teams-single-speaker-utterance.test.ts
  */
-import { TeamsCsrcGmeetPipeline, type TeamsCsrcTranscriptSegment } from './teams-csrc-gmeet-pipeline.js';
+import { TeamsCsrcGmeetPipeline, TEAMS_UNCONTESTED_MAX_OFFSET_MS, type TeamsCsrcTranscriptSegment } from './teams-csrc-gmeet-pipeline.js';
 
 let failed = 0;
 const check = (name: string, condition: boolean, detail = ''): void => {
@@ -27,7 +27,7 @@ interface Run {
 }
 
 /** Feed a 3 s utterance (12 frames) of CSRC 501 whose frame stamps trail the transport by `lagMs`. */
-async function utterance(lagMs: number, rival = false): Promise<Run> {
+async function utterance(lagMs: number, rival = false, earlierOtherLane = false): Promise<Run> {
   let now = 0;
   const run: Run = { finals: [], rows: new Map(), rejected: 0, uncontested: [], sttAudioSec: [], health: undefined as never };
   const pipeline = new TeamsCsrcGmeetPipeline({
@@ -47,6 +47,11 @@ async function utterance(lagMs: number, rival = false): Promise<Run> {
     },
   });
   const t0 = 1_000_000;
+  if (earlierOtherLane) {
+    // Another participant was reported earlier and is silent now: no audio of theirs overlaps.
+    pipeline.recordTransportEvent({ csrc: 888, active: true, tMs: t0 - 60_000 });
+    pipeline.recordTransportEvent({ csrc: 888, active: false, tMs: t0 - 59_000 });
+  }
   pipeline.recordTransportEvent({ csrc: 501, active: true, tMs: t0 });
   if (rival) pipeline.recordTransportEvent({ csrc: 777, active: true, tMs: t0 });
   for (let i = 0; i < 12; i++) {
@@ -67,7 +72,7 @@ async function utterance(lagMs: number, rival = false): Promise<Run> {
   return run;
 }
 
-for (const lagMs of [0, 2_000, 30_000]) {
+for (const lagMs of [0, 2_000]) {
   const run = await utterance(lagMs);
   const rows = [...run.rows.values()];
   check(`clock lag ${lagMs} ms: the utterance yields exactly one row, and it is final`,
@@ -83,6 +88,24 @@ for (const lagMs of [0, 2_000, 30_000]) {
 }
 
 {
+  // The offset bound: skew beyond it is not a clock disagreement, so the row is refused, not named.
+  const lagMs = TEAMS_UNCONTESTED_MAX_OFFSET_MS * 6;
+  const run = await utterance(lagMs);
+  check('a clock offset past the bound is refused even with one lane',
+    run.finals.length === 0 && run.rows.size === 0 && run.rejected >= 1 && run.uncontested.length === 0,
+    JSON.stringify({ finals: run.finals.length, rows: run.rows.size, rejected: run.rejected }));
+}
+
+{
+  // A second CSRC was reported earlier (no overlapping audio): the lane may be carrying an
+  // unreported speaker's audio, so a misfit row is refused rather than named.
+  const run = await utterance(2_000, false, true);
+  check('a misfit row is refused once another CSRC has ever been reported',
+    run.finals.length === 0 && run.rejected >= 1 && run.uncontested.length === 0,
+    JSON.stringify({ finals: run.finals.length, rejected: run.rejected }));
+}
+
+{
   // Two lanes were routed the same audio: the span must fit this CSRC's own interval or be refused.
   const run = await utterance(30_000, true);
   check('contested audio outside the CSRC interval stays refused',
@@ -91,4 +114,4 @@ for (const lagMs of [0, 2_000, 30_000]) {
 }
 
 if (failed) { console.error(`\n❌ teams single-speaker utterance: ${failed} checks FAILED.`); process.exit(1); }
-console.log('\n✅ Teams single-speaker utterance: one clip, one final row, whatever the clock offset.');
+console.log('\n✅ Teams single-speaker utterance: one clip, one final row, within the plausible clock offset.');

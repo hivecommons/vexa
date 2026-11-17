@@ -16,7 +16,7 @@ import addFormats from 'ajv-formats';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createBotPipeline, createTranscribe, perChannelLaneConfig, perChannelOnsetGapMs, PER_TRACK_ONSET_GAP_MS } from './pipeline.js';
+import { createBotPipeline, createTranscribe, redactTeamsLaneLog, perChannelLaneConfig, perChannelOnsetGapMs, PER_TRACK_ONSET_GAP_MS } from './pipeline.js';
 import type { Invocation } from './config.js';
 import type { TranscriptSegment } from './contracts.js';
 import type { TranscriptSink } from './ports.js';
@@ -514,6 +514,17 @@ async function main(): Promise<void> {
       JSON.stringify({ final, requests: n }));
     check('per-track turn gap is 2 s for zoom; google_meet keeps the lane default',
       perChannelOnsetGapMs('zoom') === PER_TRACK_ONSET_GAP_MS && PER_TRACK_ONSET_GAP_MS === 2000 && perChannelOnsetGapMs('google_meet') === undefined);
+  }
+
+  {
+    const secret = 'my password is hunter2';
+    const line = `[SpeakerStreams] [FILTERED] Hallucination for "CSRC 501": "${secret}"`;
+    const out = redactTeamsLaneLog(line);
+    check('Teams [FILTERED] log lines carry the length of the text, never the text',
+      !out.includes('hunter2') && !out.includes('password') && out.includes('[FILTERED]') && out.includes(`${secret.length} chars`), out);
+    const quoted = redactTeamsLaneLog('[SpeakerStreams] [FILTERED] Hallucination segment for "CSRC 7": "he said "hi" to me"');
+    check('a quote inside the text does not leak the rest of it', !quoted.includes('said') && !quoted.includes('hi'), quoted);
+    check('other lane log lines are unchanged', redactTeamsLaneLog('[STT-FAULT] timeout for "CSRC 7"') === '[STT-FAULT] timeout for "CSRC 7"');
   }
 
   if (failed) { console.error(`\n❌ pipeline (L3): ${failed} check(s) FAILED.`); process.exit(1); }

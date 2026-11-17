@@ -393,6 +393,16 @@ export function teamsLaneBufferConfig(
 /** Shared-window log lines the Teams lane prints: each explains a pass that produced no row. */
 const TEAMS_LANE_LOG_MARKERS = ['[FILTERED]', '[SILENT-SKIP]', '[STT-FAULT]'];
 
+/**
+ * A shared-window log line with any transcribed text removed. The [FILTERED] lines quote the first
+ * characters of the text (and so would put speech into pod logs, before consent included); only
+ * the marker, the lane name and the text's length are kept.
+ */
+export function redactTeamsLaneLog(message: string): string {
+  if (!message.includes('[FILTERED]')) return message;
+  return message.replace(/:\s*"([\s\S]*)"\s*$/, (_all, text: string) => `: <${text.length} chars redacted>`);
+}
+
 /** Build the Teams-only CSRC virtual-channel lane. The shared GMeet-compatible buffer owns
  * cadence, prompt feedback, LocalAgreement and terminal fallback. This adapter owns only the bot
  * ports: mixed PCM/identity evidence in, transcript.v1 publish/retract out. */
@@ -414,7 +424,7 @@ function createTeamsBotPipeline(
   // The shared window says why a result never became a row (filtered text, a silent window, an
   // STT fault); those lines are the only trace of a pass that published nothing.
   const laneLog = (message: string): void => {
-    if (TEAMS_LANE_LOG_MARKERS.some((marker) => message.includes(marker))) console.log(`[bot] pipeline(teams-csrc): ${message}`);
+    if (TEAMS_LANE_LOG_MARKERS.some((marker) => message.includes(marker))) console.log(`[bot] pipeline(teams-csrc): ${redactTeamsLaneLog(message)}`);
   };
 
   const transcriber = createTranscriber({
@@ -442,7 +452,7 @@ function createTeamsBotPipeline(
       console.warn(`[bot] pipeline(teams-csrc): final row ${Math.round(segment.startMs)}-${Math.round(segment.endMs)} lies outside CSRC ${segment.csrc}'s interval `
         + `(capture clock ${Math.round(offsetMs)}ms before the transport clock); published, no other lane had that audio`);
       try {
-        onObservation?.('teams-csrc-ownership-uncontested', { segment, offsetMs, intervals }, segment.endMs);
+        onObservation?.('teams-csrc-ownership-uncontested', { segment: { ...segment, text: undefined, textChars: segment.text.length }, offsetMs, intervals }, segment.endMs);
       } catch { /* diagnostics never break the transcript lane */ }
     },
     onRejectedOwnership: (segment, intervals) => {

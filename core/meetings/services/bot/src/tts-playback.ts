@@ -85,6 +85,16 @@ function setTtsMute(muted: boolean, log: (m: string) => void): void {
 /** What one spoken line cost. `synthMs`: time spent waiting on the TTS service before the first
  *  audio (0 when the first sentence came from the cache). `cached`: every sentence of the line came
  *  from the cache. `sentences`: how many the line was split into. */
+/** A line that could not be said whole: nothing was synthesized, or a sentence was dropped so the
+ *  line ended early. The caller must report it as NOT spoken; the prefix that was already played
+ *  (if any) is `playedMs`. */
+export class TtsIncompleteError extends Error {
+  constructor(readonly playedMs: number, readonly playedSentences: number, readonly totalSentences: number) {
+    super(`tts_incomplete: ${playedSentences}/${totalSentences} sentence(s) synthesized, ${playedMs} ms played`);
+    this.name = 'TtsIncompleteError';
+  }
+}
+
 export interface TtsLineStats { synthMs: number; cached: boolean; sentences: number }
 
 /** Per-line callbacks. */
@@ -387,7 +397,7 @@ export function createTtsPlayback(
       pump();
 
       let p: ReturnType<Player['start']> | null = null;
-      let bytes = 0, firstAudioMs = -1;
+      let bytes = 0, firstAudioMs = -1, played = 0, dropped = false;
       for (let i = 0; i < sentences.length && mine === generation; i++) {
         const pcm = await wanted[i];
         if (mine !== generation) break;
@@ -395,6 +405,7 @@ export function createTtsPlayback(
           // Nothing is spoken out of order or with a hole in it: the line ends at the last sentence
           // that could be synthesized.
           if (sentences.length > 1) log(`[tts] sentence ${i + 1}/${sentences.length} not synthesized; the line ends before it`);
+          dropped = true;
           break;
         }
         if (!p) {
@@ -405,8 +416,15 @@ export function createTtsPlayback(
         }
         p.input.write(pcm);
         bytes += pcm.length;
+        played++;
       }
-      if (!p) return 0;
+      // A stop (barge-in) is not a failure; a sentence that could not be synthesized is, and a line
+      // with no audio at all is never reported as spoken.
+      const interrupted = mine !== generation;
+      if (!p) {
+        if (!interrupted) throw new TtsIncompleteError(0, 0, sentences.length);
+        return 0;
+      }
       p.input.end();
       await p.done;
       if (current === p) current = null;
@@ -415,7 +433,9 @@ export function createTtsPlayback(
       try {
         hooks?.onLine?.({ synthMs: firstCached ? 0 : firstAudioMs, cached: cachedHits === sentences.length, sentences: sentences.length });
       } catch { /* a report hook never stops the line */ }
-      return Math.round(bytes / TTS_PCM_BYTES_PER_MS);
+      const playedMs = Math.round(bytes / TTS_PCM_BYTES_PER_MS);
+      if (dropped && !interrupted) throw new TtsIncompleteError(playedMs, played, sentences.length);
+      return playedMs;
     } finally {
       speaking--;
       if (speaking === 0 && idle) { const wake = idle; idle = null; wake(); }

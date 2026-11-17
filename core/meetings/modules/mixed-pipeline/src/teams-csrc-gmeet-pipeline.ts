@@ -118,6 +118,20 @@ export const TEAMS_NO_TRANSPORT_FALLBACK_MS = 3000;
  *  page capture applies, so the fallback lane carries speech stretches, not a continuous hiss. */
 export const TEAMS_FALLBACK_SILENCE_PEAK = 0.005;
 
+/**
+ * Largest capture-clock vs transport-clock offset (ms) at which a misfit final may still be
+ * published under the lane's name. Real skew is a stalled page thread or a re-anchor, well under
+ * this; anything larger is not a clock disagreement, so the row is refused.
+ */
+export const TEAMS_UNCONTESTED_MAX_OFFSET_MS = 5000;
+
+/**
+ * Another lane's routed audio within this many ms of a misfit span (capture clock) counts as
+ * competing for it, even if the two spans do not overlap: a late frame of the previous speaker
+ * lands in the next speaker's lane with a gap between the routed spans.
+ */
+export const TEAMS_COMPETING_LANE_MARGIN_MS = 5000;
+
 export interface TeamsCsrcGmeetPipelineHealth extends TeamsCsrcChannelizerHealth {
   turns: number;
   /** Turn keys the shared GMeet window still holds a buffer and a submission timer for. Bounded by
@@ -656,7 +670,16 @@ export class TeamsCsrcGmeetPipeline {
     )) {
       const segment = { csrc, speaker: this.trackNamer.labelFor(String(csrc)), sourceKey, segmentId, text, startMs, endMs: boundedEndMs, completed, language };
       const intervals = (this.ownership.get(csrc) ?? []).map((interval) => ({ ...interval }));
-      if (this.routedToAnotherLane(csrc, startMs, boundedEndMs)) {
+      // Published under the lane's name only when it is the sole CSRC the meeting has ever reported
+      // (an unreported speaker's audio is routed to the last active lane, so with a second lane
+      // known the name cannot be trusted), the offset is plausible clock skew, and no other lane
+      // was routed audio near the span. Anything else is refused: unknown beats a wrong name.
+      const offsetMs = this.ownershipOffsetMs(intervals, startMs);
+      if (
+        Math.abs(offsetMs) > TEAMS_UNCONTESTED_MAX_OFFSET_MS
+        || this.otherLaneKnown(csrc)
+        || this.routedToAnotherLane(csrc, startMs, boundedEndMs)
+      ) {
         this.rejectedOwnership++;
         this.options.onRejectedOwnership?.(segment, intervals);
         // Clear an ordinary draft under the same public key if the confirmed replacement is refused.
@@ -671,16 +694,23 @@ export class TeamsCsrcGmeetPipeline {
       // transport clock (CSRC edges), not a second voice. Publish, and report the disagreement.
       this.uncontestedOwnership++;
       try {
-        this.options.onUncontestedOwnership?.(segment, this.ownershipOffsetMs(intervals, startMs), intervals);
+        this.options.onUncontestedOwnership?.(segment, offsetMs, intervals);
       } catch { /* diagnostics never break the transcript lane */ }
     }
     this.emit({ csrc, speaker: this.trackNamer.labelFor(String(csrc)), sourceKey, segmentId, text, startMs, endMs: boundedEndMs, completed, language });
     return true;
   }
 
-  /** Was any audio in [startMs, endMs] (capture clock) also routed to a lane other than `csrc`? */
+  /** Has the transport ever reported a CSRC (or the fallback lane run) other than `csrc`? */
+  private otherLaneKnown(csrc: number): boolean {
+    for (const lane of this.ownership.keys()) if (lane !== csrc) return true;
+    return false;
+  }
+
+  /** Was audio within TEAMS_COMPETING_LANE_MARGIN_MS of [startMs, endMs] (capture clock) routed to a lane other than `csrc`? */
   private routedToAnotherLane(csrc: number, startMs: number, endMs: number): boolean {
-    return this.routedSpans.some((span) => span.csrc !== csrc && span.startMs <= endMs && span.endMs >= startMs);
+    const margin = TEAMS_COMPETING_LANE_MARGIN_MS;
+    return this.routedSpans.some((span) => span.csrc !== csrc && span.startMs <= endMs + margin && span.endMs >= startMs - margin);
   }
 
   /** How far `startMs` sits before the nearest ownership interval's start (ms; negative: after). */

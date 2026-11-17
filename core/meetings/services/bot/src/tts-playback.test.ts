@@ -9,7 +9,7 @@ import { PassThrough, type Readable } from 'node:stream';
 import {
   conditionPcm, createTtsPlayback, prewarmLinesFromEnv, prewarmVoicesFromEnv, splitSentences, synthConcurrencyFromEnv,
   TTS_CACHE_MAX_CHARS, TTS_FADE_MS, TTS_PCM_RATE_HZ, TTS_PREWARM_MAX_LINE_CHARS, TTS_PREWARM_MAX_LINES,
-  TTS_SENTENCE_MAX_CHARS, type Player, type Synthesize,
+  TTS_SENTENCE_MAX_CHARS, TtsIncompleteError, type Player, type Synthesize,
 } from './tts-playback.js';
 
 let failed = 0;
@@ -121,11 +121,17 @@ function fakes(opts: { delayMs?: (text: string) => number; fail?: (text: string)
   const f = fakes({ fail: (t) => t.startsWith('Broken') });
   const logs: string[] = [];
   const tts = createTtsPlayback((m) => logs.push(m), { synthesize: f.synthesize, player: f.player, prewarmLines: [] });
-  const ms = await tts.speak('A sentence that works. Broken sentence in the middle. The one after it.');
+  let partial: unknown;
+  await tts.speak('A sentence that works. Broken sentence in the middle. The one after it.').catch((e) => { partial = e; });
   check('a sentence that cannot be synthesized ends the line there (no hole, no reordering)',
-    ms === CLIP_MS && f.played[0].length === CLIP_SAMPLES * 2, `${ms} ms`);
-  const none = await tts.speak('Broken from the start.');
-  check('a line with nothing synthesized plays nothing and reports 0 ms', none === 0 && f.sessions() === 1, `${none} ms, ${f.sessions()} session(s)`);
+    f.played[0].length === CLIP_SAMPLES * 2, `${f.played[0]?.length}`);
+  check('and the line is reported as incomplete, never as spoken (the consent invariant)',
+    partial instanceof TtsIncompleteError && partial.playedMs === CLIP_MS && partial.playedSentences === 1 && partial.totalSentences === 3,
+    String(partial));
+  let none: unknown;
+  await tts.speak('Broken from the start.').catch((e) => { none = e; });
+  check('a line with nothing synthesized plays nothing and fails instead of reporting 0 ms spoken',
+    none instanceof TtsIncompleteError && none.playedMs === 0 && f.sessions() === 1, `${String(none)}, ${f.sessions()} session(s)`);
 }
 {
   const f = fakes();
