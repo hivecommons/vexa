@@ -85,5 +85,33 @@ pc.emit({ track: { id: 'video-1', kind: 'video' }, streams: [] });
 check('video tracks are ignored', win.__vexaCapturedRemoteAudioStreams.length === 2,
   `n=${win.__vexaCapturedRemoteAudioStreams.length}`);
 
+// ── TEAMS SHARES ONE PAGE STREAM ACROSS RECEIVE TRACKS (hivecommons/hive#18590 finding 10). ──
+// Teams groups receive tracks under one msid, so several track events carry the SAME
+// event.streams[0], and it swaps tracks inside that object as it renegotiates. Mirroring that
+// shared object meant the mixer (which dedups by stream id) never connected the second track, and
+// createMediaStreamSource bound whichever audio track the stream held first — on the live test a
+// dead one: `main-audio-silent` every 2 s, streamCount 3, while the host spoke. Each mirrored
+// stream must hold exactly ONE track, its own, whatever the page does with its stream later.
+{
+  const before = win.__vexaCapturedRemoteAudioStreams.length;
+  const dead = { id: 'mainAudio-23001', kind: 'audio' };
+  const live = { id: 'mainAudio-23002', kind: 'audio' };
+  const shared = new win.MediaStream([dead]);
+  pc.emit({ track: dead, streams: [shared] });
+  shared.tracks.push(live);                       // Teams adds the new track to the SAME stream…
+  pc.emit({ track: live, streams: [shared] });
+  shared.tracks.splice(0, 1);                     // …and drops the old one from it
+  const mirrored = win.__vexaCapturedRemoteAudioStreams.slice(before);
+  check('two tracks in one shared page stream yield two DISTINCT mirrored streams',
+    mirrored.length === 2 && mirrored[0] !== mirrored[1] && mirrored[0] !== shared && mirrored[1] !== shared,
+    `n=${mirrored.length}`);
+  check('each mirrored stream holds exactly its own track (stream identity == track identity)',
+    mirrored[0]?.getAudioTracks().length === 1 && mirrored[0].getAudioTracks()[0] === dead
+      && mirrored[1]?.getAudioTracks().length === 1 && mirrored[1].getAudioTracks()[0] === live,
+    JSON.stringify(mirrored.map((m: any) => m.getAudioTracks().map((t: any) => t.id))));
+  check('the page mutating its own stream does not change what was mirrored',
+    mirrored[1].getAudioTracks()[0].id === 'mainAudio-23002' && shared.getAudioTracks().length === 1);
+}
+
 if (failed) { console.error(`\n❌ webrtc-dedup: ${failed} check(s) FAILED.`); process.exit(1); }
 console.log('\n✅ webrtc-dedup: each remote audio track is mirrored exactly once, so the mixer cannot sum a track with itself.');

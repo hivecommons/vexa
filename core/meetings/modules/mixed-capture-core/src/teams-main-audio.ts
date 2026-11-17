@@ -25,7 +25,12 @@
  */
 
 /** The shape this needs from a MediaStream — anything exposing audio tracks with ids. */
-export interface AudioTrackLike { id?: string }
+export interface AudioTrackLike { id?: string; readyState?: string; muted?: boolean }
+
+/** One audio track's state as the page saw it, carried on every observation: `muted: true` on every
+ *  track means no RTP is arriving (Teams is not sending audio to this client at all), while live,
+ *  unmuted tracks that still read silent point at the capture path instead. */
+export interface TrackStateLike { id: string; readyState: string; muted: boolean }
 export interface StreamLike { getAudioTracks?: () => AudioTrackLike[] }
 
 /** Emitted whenever the mix is absent past the grace window and capture falls back to all tracks. */
@@ -36,6 +41,7 @@ export interface MainAudioAbsentObservation {
   streamCount: number;
   /** The ids actually seen, so a rotted prefix is diagnosable from the log alone. */
   trackIds: string[];
+  tracks: TrackStateLike[];
   action: string;
 }
 
@@ -47,6 +53,7 @@ export interface MainAudioSilentObservation {
   capturedMs: number;
   streamCount: number;
   trackIds: string[];
+  tracks: TrackStateLike[];
   action: string;
 }
 
@@ -91,8 +98,19 @@ export function mainAudioProvedSilent(
   return nowMs - captureStartedMs >= silenceMs;
 }
 
+/** A stream carrying a `mainAudio` track that has not ENDED. An ended track never produces audio
+ *  again; when Teams replaces the mix (renegotiation) the old track ends and a new one arrives, and
+ *  the ended one must not be picked over it. */
 const hasMainAudio = (s: StreamLike): boolean =>
-  (s.getAudioTracks?.() || []).some((t) => String(t?.id || '').toLowerCase().startsWith('mainaudio'));
+  (s.getAudioTracks?.() || []).some((t) => String(t?.id || '').toLowerCase().startsWith('mainaudio')
+    && t?.readyState !== 'ended');
+
+const trackStatesOf = (streams: StreamLike[]): TrackStateLike[] =>
+  (streams || [])
+    .flatMap((s) => (s.getAudioTracks?.() || []).map((t) => ({
+      id: String(t?.id || ''), readyState: String(t?.readyState ?? 'unknown'), muted: t?.muted === true,
+    })))
+    .slice(0, 8);
 
 const trackIdsOf = (streams: StreamLike[]): string[] =>
   (streams || [])
@@ -129,6 +147,7 @@ export function selectTeamsMixStreams(
         capturedMs: Math.max(0, Math.round(mainAudioCapturedMs)),
         streamCount: (streams || []).length,
         trackIds: trackIdsOf(streams),
+        tracks: trackStatesOf(streams),
         action: 'mainAudio mix was picked but carried NO energetic audio — capturing ALL tracks instead',
       },
     };
@@ -145,9 +164,8 @@ export function selectTeamsMixStreams(
       platform: 'teams',
       waitedMs,
       streamCount: (streams || []).length,
-      trackIds: (streams || [])
-        .flatMap((s) => (s.getAudioTracks?.() || []).map((t) => String(t?.id || '')))
-        .slice(0, 8),
+      trackIds: trackIdsOf(streams),
+      tracks: trackStatesOf(streams),
       action: 'capturing ALL tracks (fail-open) — audio may be double-fed; the mainAudio selector may have rotted',
     },
   };

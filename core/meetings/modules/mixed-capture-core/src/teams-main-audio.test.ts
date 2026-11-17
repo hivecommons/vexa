@@ -118,5 +118,31 @@ const stream = (...ids: string[]): StreamLike => ({ getAudioTracks: () => ids.ma
     rescans.every((r) => r.observation?.kind === 'main-audio-silent'));
 }
 
+// ── 10. hivecommons/hive#18590 finding 10: streamCount 3, the first mix track is DEAD (ended after a
+// renegotiation) and a second mix track carries the speech. The ended one must never be the pick. ──
+{
+  const t = (id: string, readyState: string, muted = false) => ({ id, readyState, muted });
+  const deadMix: StreamLike = { getAudioTracks: () => [t('mainAudio-23001', 'ended', true)] };
+  const liveMix: StreamLike = { getAudioTracks: () => [t('mainAudio-23002', 'live')] };
+  const redundant: StreamLike = { getAudioTracks: () => [t('dominantSpeaker-4', 'live')] };
+  const r = selectTeamsMixStreams([deadMix, liveMix, redundant], { firstMissMs: null, nowMs: 1_000_000 });
+  check('an ENDED mainAudio track is not picked over the live one',
+    r.outcome === 'main-audio' && r.streams.length === 1 && r.streams[0] === liveMix,
+    `${r.outcome} n=${r.streams.length}`);
+
+  const onlyDead = selectTeamsMixStreams([deadMix, redundant], { firstMissMs: 1_000_000, nowMs: 1_020_000, graceMs: 15_000 });
+  check('a mix whose only track has ended counts as absent and fails open to every track',
+    onlyDead.outcome === 'fallback-all' && onlyDead.streams.length === 2, `${onlyDead.outcome}/${onlyDead.streams.length}`);
+
+  const silent = selectTeamsMixStreams([deadMix, liveMix, redundant],
+    { firstMissMs: null, nowMs: 1_000_000, mainAudioSilent: true, mainAudioCapturedMs: 21_000 });
+  const states = (silent.observation as any)?.tracks as Array<{ id: string; readyState: string; muted: boolean }>;
+  check('the silent report carries each track\'s readyState and muted flag (no RTP vs capture path)',
+    Array.isArray(states) && states.length === 3
+      && states[0].id === 'mainAudio-23001' && states[0].readyState === 'ended' && states[0].muted === true
+      && states[1].readyState === 'live' && states[1].muted === false,
+    JSON.stringify(states));
+}
+
 if (failed) { console.error(`\n❌ teams-main-audio: ${failed} check(s) FAILED.`); process.exit(1); }
 console.log('\n✅ teams-main-audio: the mix wins when present; when the selector finds nothing it fails OPEN and keeps saying so.');
