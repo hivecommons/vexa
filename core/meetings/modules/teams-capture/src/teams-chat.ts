@@ -413,6 +413,33 @@ export function findTeamsChatToggle(): TeamsChatHit | null {
   return null;
 }
 
+/** The control bar's "More" overflow button. A narrow window (the bot's) moves Chat into this menu,
+ *  so the bar then carries no chat button at all. */
+export const teamsMoreButtonSelectors: string[] = [
+  '#callingButtons-showMoreBtn',
+  '[data-tid="callingButtons-showMoreBtn"]',
+  'button[aria-label="More" i]',
+];
+
+/** The "More" overflow button, or null. */
+export function findTeamsMoreButton(): HTMLElement | null {
+  for (const sel of teamsMoreButtonSelectors) {
+    const el = document.querySelector(sel);
+    if (el) return el as HTMLElement;
+  }
+  return null;
+}
+
+/** A "Chat" entry inside an open overflow menu, or null. */
+export function findTeamsChatMenuItem(): HTMLElement | null {
+  const items = Array.from(document.querySelectorAll('[role="menuitem"], [role="menuitemcheckbox"], [role="menu"] button'));
+  for (const el of items) {
+    const label = normalizeLine(el.getAttribute('aria-label') || el.textContent || '');
+    if (/^chat\b/i.test(label)) return el as HTMLElement;
+  }
+  return null;
+}
+
 /** Open the chat panel when it is closed. True when the composer is already there or a toggle was
  *  clicked; false when neither is in the DOM. A toggle that says it is pressed is not clicked (that
  *  would close a panel that is still mounting). */
@@ -428,7 +455,7 @@ export function openTeamsChatPanel(): boolean {
 /** How long a send waits for the composer by default. Right after admission Teams is still
  *  rendering the meeting shell: the control bar (and its chat toggle) can take several seconds to
  *  mount, and the panel a moment more once opened. */
-export const TEAMS_CHAT_COMPOSER_WAIT_MS = 10000;
+export const TEAMS_CHAT_COMPOSER_WAIT_MS = 20000;
 /** When each toggle element was last clicked by the reader or a send, so the two never click the
  *  same toggle within `gapMs` of each other (a second click would close the panel the first one
  *  is opening). */
@@ -448,6 +475,8 @@ const TEAMS_CHAT_POLL_MS = 100;
 const TEAMS_CHAT_MAX_TOGGLE_CLICKS = 2;
 /** Least time between two toggle clicks, so a panel that is still mounting is not closed again. */
 const TEAMS_CHAT_TOGGLE_RECLICK_MS = 3000;
+/** How long a send looks for a chat button in the bar before it opens the "More" overflow menu. */
+const TEAMS_CHAT_MORE_AFTER_MS = 1500;
 
 const teamsSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -464,6 +493,7 @@ async function awaitTeamsComposer(
   let clicks = 0;
   let lastClick = 0;
   let sawPressed = false;
+  let lastMore = 0;
   for (;;) {
     const composer = findTeamsChatComposer();
     if (composer) {
@@ -479,6 +509,17 @@ async function awaitTeamsComposer(
       && clickTeamsChatToggle(toggle.el, TEAMS_CHAT_TOGGLE_RECLICK_MS)) {
       clicks += 1;
       lastClick = now;
+    }
+    if (!toggle) {
+      // No chat button in the bar: it sits in the "More" overflow. Click the entry when the menu
+      // is open; otherwise open the menu (again only after the reclick gap, so it is not closed).
+      const item = findTeamsChatMenuItem();
+      if (item) {
+        if (clickTeamsChatToggle(item, TEAMS_CHAT_TOGGLE_RECLICK_MS)) { clicks += 1; lastClick = now; }
+      } else if (now - start >= TEAMS_CHAT_MORE_AFTER_MS && now - lastMore >= TEAMS_CHAT_TOGGLE_RECLICK_MS) {
+        const more = findTeamsMoreButton();
+        if (more && more.getAttribute('aria-expanded') !== 'true') { more.click(); lastMore = now; }
+      }
     }
     if (now >= deadline) {
       const hidden = findHiddenTeamsChatComposer();
