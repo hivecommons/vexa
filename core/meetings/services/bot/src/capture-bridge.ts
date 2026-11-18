@@ -46,6 +46,7 @@ import type { BotRecordingSink } from './recording.js';
 import type { TelemetrySink } from './ports.js';
 import type { RemoteAudioActivityTap } from './aloneness.js';
 import { createTtsPlayback } from './tts-playback.js';
+import { isListeningTone } from './listening-tone.js';
 import { writeBackSession } from './session-writeback.js';
 import { restoreSession } from './session-restore.js';
 import { guardMeetingNavigation, meetingNavigationPolicy, pinMeetingHostArgs, type NavigationGuard } from './meeting-navigation.js';
@@ -1773,7 +1774,13 @@ export function createSpeakController(
     const startedAt = Date.now();
     const queueMs = startedAt - receivedAt;
     console.log(`[bot] speak: "${text.slice(0, 60)}"`);
-    if (!(await ensureMicOpen())) {
+    // The listening tone is a courtesy: it reads the mic once and never toggles it (which can take
+    // a second), so it cannot hold an answer up; a shut mic drops it.
+    if (isListeningTone(text) && (await readMic()).state !== 'unmuted') {
+      console.log('[bot] speak: listening tone dropped (mic not open)');
+      return { spoken: false, reason: 'stopped' };
+    }
+    if (!isListeningTone(text) && !(await ensureMicOpen())) {
       console.error('[bot] speak_failed reason=mic_muted — the line was not played');
       return { spoken: false, reason: 'mic_muted' };
     }
@@ -1824,6 +1831,12 @@ export function createSpeakController(
       const receivedAt = Date.now();
       if (queued > 0) console.log(`[bot] speak: queued behind ${queued} line(s)`);
       queued++;
+      // The listening tone never waits behind a line: with one playing or queued it is dropped. The
+      // act's `failed: stopped` report means "not played", which is all a tone ever needs.
+      if (isListeningTone(text) && queued > 0) {
+        console.log('[bot] speak: listening tone dropped (a line is being spoken)');
+        return { spoken: false, reason: 'stopped' };
+      }
       const run = tail.then(async (): Promise<SpeakResult> => {
         if (mine !== generation) {
           console.log('[bot] speak: dropped by speak_stop before it played');

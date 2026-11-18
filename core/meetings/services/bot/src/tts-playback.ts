@@ -24,6 +24,9 @@
  * fade at both ends (no click at a clip edge), and between sentences and lines the sink carries
  * exact digital silence.
  *
+ * The reserved line LISTENING_TONE_TEXT is not synthesized: it plays the pre-rendered listening
+ * tone (listening-tone.ts) at once, and is dropped, never queued, while a line is being spoken.
+ *
  * acts.v1 `speak` already carries {text, voice} — no contract change. Config is infrastructure
  * (the TTS service URL/token), read from env like production (TTS_SERVICE_URL / TTS_API_TOKEN),
  * NOT the sealed invocation.v1. Gated by the SpeakController on inv.voiceAgentEnabled.
@@ -34,6 +37,7 @@ import { spawn, execSync, type ChildProcess } from 'node:child_process';
 import https from 'node:https';
 import http from 'node:http';
 import type { Readable } from 'node:stream';
+import { isListeningTone, renderListeningTone, toneDurationMs } from './listening-tone.js';
 
 /** The TTS service's PCM: 24 kHz, mono, 16-bit little-endian. */
 export const TTS_PCM_RATE_HZ = 24_000;
@@ -376,7 +380,35 @@ export function createTtsPlayback(
     setTtsMute(true, log);
   };
 
+  // The listening tone is rendered once, here, so playing it costs no synthesis.
+  const tonePcm = renderListeningTone();
+  /** Play the listening tone now; 0 (nothing played) when a line is playing or the player fails. It
+   *  never waits for a line, and never holds one up beyond its own length. */
+  const playTone = async (hooks?: TtsSpeakHooks): Promise<number> => {
+    if (speaking > 0 || current) return 0;
+    const mine = generation;
+    speaking++;
+    try {
+      const p = player.start();
+      current = p;
+      try { hooks?.onFirstAudio?.(); } catch { /* a report hook never stops the line */ }
+      p.input.write(tonePcm);
+      p.input.end();
+      await p.done;
+      if (current === p) current = null;
+      try { hooks?.onLine?.({ synthMs: 0, cached: true, sentences: 1 }); } catch { /* */ }
+      return mine === generation ? toneDurationMs(tonePcm) : 0;
+    } catch (e) {
+      log(`[tts] listening tone not played: ${String(e)}`);
+      return 0;
+    } finally {
+      speaking--;
+      if (speaking === 0 && idle) { const wake = idle; idle = null; wake(); }
+    }
+  };
+
   const speak = async (text: string, voice = TTS_DEFAULT_VOICE, hooks?: TtsSpeakHooks): Promise<number> => {
+    if (isListeningTone(text)) return playTone(hooks);
     const sentences = splitSentences(text);
     if (!sentences.length) return 0;
     const mine = generation;
