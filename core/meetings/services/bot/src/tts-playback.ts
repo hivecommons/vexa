@@ -67,8 +67,12 @@ export const TTS_SENTENCE_MIN_CHARS = 12;
 export const TTS_FADE_MS = 5;
 /** A mean sample value beyond this (of 32768) is a DC offset and is removed. */
 export const TTS_DC_OFFSET_MIN = 16;
-/** Sentences synthesized at once behind the one playing (BOT_TTS_SYNTH_CONCURRENCY). */
-export const TTS_SYNTH_CONCURRENCY_DEFAULT = 2;
+/** Sentences synthesized at once behind the one playing (BOT_TTS_SYNTH_CONCURRENCY). One: on a CPU
+ *  Kokoro (about real time per stream) two requests in flight both finish after the combined work,
+ *  so the first sentence reached the meeting only once the second was also done (live Meet test:
+ *  first audio 14.6 s, both syntheses "completed in 14.6 s"). Raise it where synthesis is faster
+ *  than real time (a GPU). */
+export const TTS_SYNTH_CONCURRENCY_DEFAULT = 1;
 const TTS_SYNTH_CONCURRENCY_MAX = 8;
 
 /** Gate the bot's voice at tts_sink only. virtual_mic (the source Chromium captures) stays unmuted:
@@ -140,7 +144,7 @@ export function prewarmVoicesFromEnv(env: NodeJS.ProcessEnv = process.env): stri
   return [...new Set([TTS_DEFAULT_VOICE, ...named])];
 }
 
-/** BOT_TTS_SYNTH_CONCURRENCY: sentences synthesized at once (1..8, default 2). */
+/** BOT_TTS_SYNTH_CONCURRENCY: sentences synthesized at once (1..8, default 1). */
 export function synthConcurrencyFromEnv(env: NodeJS.ProcessEnv = process.env): number {
   const v = Number((env.BOT_TTS_SYNTH_CONCURRENCY ?? '').trim());
   return Number.isInteger(v) && v >= 1 ? Math.min(v, TTS_SYNTH_CONCURRENCY_MAX) : TTS_SYNTH_CONCURRENCY_DEFAULT;
@@ -397,9 +401,13 @@ export function createTtsPlayback(
       pump();
 
       let p: ReturnType<Player['start']> | null = null;
-      let bytes = 0, firstAudioMs = -1, played = 0, dropped = false;
+      let bytes = 0, firstAudioMs = -1, played = 0, dropped = false, stalledMs = 0;
+      const readyMs: number[] = [];                   // per sentence: request to its PCM in hand
       for (let i = 0; i < sentences.length && mine === generation; i++) {
+        const waitStart = now();
         const pcm = await wanted[i];
+        readyMs.push(now() - started);
+        if (p) stalledMs += now() - waitStart;        // playing, and waiting for the next sentence: a gap in the speech
         if (mine !== generation) break;
         if (!pcm) {
           // Nothing is spoken out of order or with a hole in it: the line ends at the last sentence
@@ -429,7 +437,8 @@ export function createTtsPlayback(
       await p.done;
       if (current === p) current = null;
       log(`[tts] line: ${sentences.length} sentence(s), ${cachedHits} cached, first audio after ${firstAudioMs} ms, `
-        + `${Math.round(bytes / TTS_PCM_BYTES_PER_MS)} ms of audio, ${now() - started} ms in all`);
+        + `${Math.round(bytes / TTS_PCM_BYTES_PER_MS)} ms of audio, ${now() - started} ms in all, `
+        + `sentences ready at [${readyMs.join(', ')}] ms, ${stalledMs} ms stalled between sentences`);
       try {
         hooks?.onLine?.({ synthMs: firstCached ? 0 : firstAudioMs, cached: cachedHits === sentences.length, sentences: sentences.length });
       } catch { /* a report hook never stops the line */ }
