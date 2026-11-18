@@ -11,6 +11,7 @@ import {
   TTS_CACHE_MAX_CHARS, TTS_FADE_MS, TTS_PCM_RATE_HZ, TTS_PREWARM_MAX_LINE_CHARS, TTS_PREWARM_MAX_LINES,
   TTS_SENTENCE_MAX_CHARS, TtsIncompleteError, type Player, type Synthesize,
 } from './tts-playback.js';
+import { LISTENING_TONE_TEXT, renderListeningTone, toneDurationMs } from './listening-tone.js';
 
 let failed = 0;
 const check = (name: string, cond: boolean, detail = '') => { console.log(`  ${cond ? '✅' : '❌'} ${name}${cond ? '' : '  — ' + detail}`); if (!cond) failed++; };
@@ -236,6 +237,32 @@ function fakes(opts: { delayMs?: (text: string) => number; fail?: (text: string)
     peak === 10000 && Math.abs(sum / CLIP_SAMPLES) < 1, `peak ${peak}, mean ${sum / CLIP_SAMPLES}`);
   check('a trailing half sample is dropped', conditionPcm(Buffer.concat([sq, Buffer.from([1])])).length === sq.length);
   check('an empty clip stays empty', conditionPcm(Buffer.alloc(0)).length === 0);
+}
+
+// ── the listening tone ──
+{
+  const f = fakes();
+  const tts = createTtsPlayback(() => {}, { synthesize: f.synthesize, player: f.player, prewarmLines: [] });
+  let first = 0, line = 0;
+  const t0 = Date.now();
+  const ms = await tts.speak(LISTENING_TONE_TEXT, 'af_heart', { onFirstAudio: () => { first++; }, onLine: () => { line++; } });
+  check('the tone is never sent to the TTS service', f.synthesized.length === 0, JSON.stringify(f.synthesized));
+  check('it plays the pre-rendered chime in one player session', f.sessions() === 1 && f.played.length === 1 && f.played[0].equals(renderListeningTone()));
+  check('and reports its own length', ms === toneDurationMs(renderListeningTone()) && ms >= 150 && ms <= 250, String(ms));
+  check('with no synthesis wait', Date.now() - t0 < SYNTH_MS / 2, `${Date.now() - t0} ms`);
+  check('the first-audio and line hooks fire once each', first === 1 && line === 1, `${first} ${line}`);
+  // Never behind speech: with a line in progress the tone is dropped and plays nothing.
+  const speaking = tts.speak('A sentence that takes a while to synthesize.', 'af_heart');
+  const dropped = await tts.speak(LISTENING_TONE_TEXT);
+  check('a tone asked for while a line is being spoken is dropped', dropped === 0, String(dropped));
+  await speaking;
+  check('and the line is unharmed and the only thing played', f.sessions() === 2 && f.played.length === 2, `${f.sessions()} sessions`);
+  // A broken player never throws out of the tone.
+  const broken = createTtsPlayback(() => {}, {
+    synthesize: f.synthesize, prewarmLines: [],
+    player: { start() { throw new Error('no paplay'); } },
+  });
+  check('a failing audio path drops the tone silently', (await broken.speak(LISTENING_TONE_TEXT)) === 0);
 }
 
 // ── env ──
