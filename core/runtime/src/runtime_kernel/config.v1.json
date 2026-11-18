@@ -509,7 +509,7 @@
     {
       "key": "BOT_TTS_SYNTH_CONCURRENCY",
       "class": "defaulted",
-      "default": "(unset: bot default 2)",
+      "default": "(unset: bot default 1)",
       "description": "sentences of one spoken line a voice bot has in synthesis at once (1-8): the first sentence plays while the next ones are synthesized; forwarded to spawned bots",
       "targets": [
         "compose",

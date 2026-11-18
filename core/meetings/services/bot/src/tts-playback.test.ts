@@ -279,9 +279,9 @@ function fakes(opts: { delayMs?: (text: string) => number; fail?: (text: string)
   check('BOT_TTS_PREWARM_VOICES: the default voice first, then the named ones, once each',
     JSON.stringify(prewarmVoicesFromEnv({ BOT_TTS_PREWARM_VOICES: ' af_heart, bm_george ,af_heart,auto' })) === JSON.stringify(['auto', 'af_heart', 'bm_george']));
   check('BOT_TTS_PREWARM_VOICES unset: the default voice only', JSON.stringify(prewarmVoicesFromEnv({})) === JSON.stringify(['auto']));
-  check('BOT_TTS_SYNTH_CONCURRENCY: default 2, bounded, invalid ignored',
-    synthConcurrencyFromEnv({}) === 2 && synthConcurrencyFromEnv({ BOT_TTS_SYNTH_CONCURRENCY: '3' }) === 3
-      && synthConcurrencyFromEnv({ BOT_TTS_SYNTH_CONCURRENCY: '99' }) === 8 && synthConcurrencyFromEnv({ BOT_TTS_SYNTH_CONCURRENCY: 'x' }) === 2);
+  check('BOT_TTS_SYNTH_CONCURRENCY: default 1, bounded, invalid ignored',
+    synthConcurrencyFromEnv({}) === 1 && synthConcurrencyFromEnv({ BOT_TTS_SYNTH_CONCURRENCY: '3' }) === 3
+      && synthConcurrencyFromEnv({ BOT_TTS_SYNTH_CONCURRENCY: '99' }) === 8 && synthConcurrencyFromEnv({ BOT_TTS_SYNTH_CONCURRENCY: 'x' }) === 1);
 }
 
 if (failed) { console.error(`\n❌ tts-playback: ${failed} check(s) failed`); process.exit(1); }

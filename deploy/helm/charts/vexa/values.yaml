@@ -767,7 +767,7 @@ runtime:
   # BOT_TTS_PREWARM_VOICES: voices the prewarm lines are synthesized for when the bot starts,
   # ","-separated (the voices its agent speaks with). "" = the default voice only.
   ttsPrewarmVoices: ""
-  # BOT_TTS_SYNTH_CONCURRENCY: sentences of one spoken line synthesized at once, 1..8. "" = 2.
+  # BOT_TTS_SYNTH_CONCURRENCY: sentences of one spoken line synthesized at once, 1..8. "" = 1.
   ttsSynthConcurrency: ""
   # BOT_STT_HOTWORDS: names and domain words sent as hotwords with every bot transcription request
   # (e.g. "Betty, hive queue, pull request"). "" = none.
