@@ -1,4 +1,4 @@
-import { log } from './log.js';
+import { log, redactFilteredLog } from './log.js';
 import { isHallucination } from './hallucination-filter.js';
 import { longestCommonWordPrefix } from '@vexa/transcribe-buffer';
 
@@ -742,7 +742,7 @@ export class SpeakerStreamManager {
 
     // Hallucination filter — drop known junk before it enters the confirmation pipeline
     if (this.junk(buffer, trimmed)) {
-      log(`[SpeakerStreams] [FILTERED] Hallucination for "${buffer.speakerName}": "${trimmed.substring(0, 60)}"`);
+      log(redactFilteredLog(`[SpeakerStreams] [FILTERED] Hallucination for "${buffer.speakerName}": "${trimmed.substring(0, 60)}"`));
       if (buffer.idleSubmitted) {
         // The FINAL submit hallucinated, but earlier pending text was clean —
         // finalize the last good text rather than losing the whole turn.
@@ -814,7 +814,7 @@ export class SpeakerStreamManager {
             const segEndMs = timeAtOffset(seg.end);
             if (!seg.text.trim() || !this.onSegmentConfirmed) continue;
             if (this.junk(buffer, seg.text.trim())) {
-              log(`[SpeakerStreams] [FILTERED] Hallucination segment for "${buffer.speakerName}": "${seg.text.trim().substring(0, 60)}"`);
+              log(redactFilteredLog(`[SpeakerStreams] [FILTERED] Hallucination segment for "${buffer.speakerName}": "${seg.text.trim().substring(0, 60)}"`));
               continue;
             }
             const segmentId = `${buffer.speakerId}:${buffer.sequenceNumber}`;
@@ -1604,7 +1604,7 @@ export class SpeakerStreamManager {
   private emitSegment(buffer: SpeakerBuffer, text: string): void {
     if (!text || !this.onSegmentConfirmed) return;
     if (this.junk(buffer, text)) {
-      log(`[SpeakerStreams] [FILTERED] Hallucination in emit for "${buffer.speakerName}": "${text.substring(0, 60)}"`);
+      log(redactFilteredLog(`[SpeakerStreams] [FILTERED] Hallucination in emit for "${buffer.speakerName}": "${text.substring(0, 60)}"`));
       return;
     }
     // Dedup: don't re-emit the same text that was just confirmed (acoustic echo / residual audio)
