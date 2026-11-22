@@ -1609,7 +1609,7 @@ export class SpeakerStreamManager {
     }
     // Dedup: don't re-emit the same text that was just confirmed (acoustic echo / residual audio)
     if (text === buffer.lastConfirmedText) {
-      log(`[SpeakerStreams] Dedup skip for "${buffer.speakerName}": "${text.substring(0, 50)}" (same as last confirmed)`);
+      log(`[SpeakerStreams] Dedup skip for "${buffer.speakerName}": <${text.length} chars redacted> (same as last confirmed)`);
       // The text is already confirmed, but a pending draft of it may still be dangling under a
       // DIFFERENT id — clear it so no completed:false lingers (the stale-pending bug's dedup case).
       this.clearStaleDraft(buffer, buffer.windowStartMs);
