@@ -20,7 +20,7 @@ no audio of its own:
 - `createTeamsChat` — reads the chat panel (content tier); emits each new message as `{ sender, text }`.
 
 **Two hosts, one brick** — the [bot](../../services/) instantiates it in a `page.evaluate` (bundled
-into its browser globals); the [extension](../../../clients/) imports it on Teams hosts to label the
+into its browser globals); the [extension](../../../../clients/) imports it on Teams hosts to label the
 mixed `tabCapture` track. Selectors are defensive (Teams' `data-tid` DOM shifts across builds).
 
 ## Surface

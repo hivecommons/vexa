@@ -17,7 +17,7 @@ constraints learned the hard way in the extension's offscreen document). `instal
 patches `RTCPeerConnection` so each remote participant's audio track is mirrored into a hidden
 `<audio data-vexa-injected>` element, exposing per-participant streams that Zoom/Teams hide in the DOM.
 
-**Two hosts, one brick** — the [extension](../../../clients/)'s offscreen document and the
+**Two hosts, one brick** — the [extension](../../../../clients/)'s offscreen document and the
 [bot](../../services/) container both consume this; same shape as the other capture bricks.
 Recording (the mix → `recording.v1`) is a separate concern, not here.
 

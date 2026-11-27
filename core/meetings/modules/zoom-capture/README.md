@@ -25,7 +25,7 @@ no audio of its own:
   way [`GmeetChannelBinder`](../gmeet-capture/) and [`TrackNamer`](../mixed-pipeline/) are.
 
 **Two hosts, one brick** — the [bot](../../services/) reads `window.__vexaZoomSpeakers` (bundled into
-its browser globals); the [extension](../../../clients/) imports it to label the mixed `tabCapture`
+its browser globals); the [extension](../../../../clients/) imports it to label the mixed `tabCapture`
 track. Selectors mirror the bot's Zoom `selectors.ts` and are defensive (Zoom's DOM shifts across builds).
 
 ## Surface

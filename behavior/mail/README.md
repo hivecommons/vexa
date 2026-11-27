@@ -9,7 +9,7 @@ These files are the SOURCE. The live copies a send actually reads are at
 `/workspaces/_global/mail/<name>.md` on the stack — same content, edited in both, or the source
 lies. Nothing is rebuilt when they change; the next mail picks up the new text. If `_global` holds
 no override, the step falls back to the identical baked default in
-[`flows_steps/mailtext.py`](../../../core/flows/src/flows_steps/mailtext.py) — so a fresh deployment
+[`flows_steps/mailtext.py`](../../core/flows/src/flows_steps/mailtext.py) — so a fresh deployment
 mails correctly before anyone has edited anything.
 
 ## Format
