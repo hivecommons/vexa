@@ -9,7 +9,7 @@ That binds identity to the *audio* at the source: Meet's remote channels are an 
 pool (channel ≠ speaker), but the glow names the live speaker, so the downstream
 [`gmeet-pipeline`](../gmeet-pipeline/) transcribes per-name with no diarizer.
 
-**Two hosts, one brick** — the [extension](../../../clients/) wires the `capture.v1` sink to the WS
+**Two hosts, one brick** — the [extension](../../../../clients/) wires the `capture.v1` sink to the WS
 codec (live); the [bot](../../services/) wires it to its in-process sink (container). The `capture.v1`
 model + wire codec is [`@vexa/capture-codec`](../capture-codec/) (the SSOT).
 

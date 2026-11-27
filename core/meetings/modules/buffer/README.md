@@ -20,7 +20,7 @@ confirmed-text prompt feedback, segment-prefix LocalAgreement, identical-full-te
 pending/final lifecycle, silence gate, hard cap, idle/terminal flush, and stale-response handling.
 
 Its defaults are behaviorally parity-locked against the still-untouched Google Meet source by
-[`src/gmeet-compatible-buffer.parity.test.ts`](src/gmeet-compatible-buffer.parity.test.ts). Teams
+[`gmeet-pipeline/src/gmeet-compatible-buffer.parity.test.ts`](../gmeet-pipeline/src/gmeet-compatible-buffer.parity.test.ts). Teams
 imports the shared class now. Google Meet deliberately keeps its pipeline-local class for this
 release; after Teams wins on diverse fixtures, a later release can switch Google Meet to this
 package and delete the duplicate source.
