@@ -32,8 +32,8 @@ uv run pytest -q                 # the autonomous contract suite (no GPU, no mod
 ```
 
 Container builds: `Dockerfile` (GPU, `nvidia/cuda` base) and `Dockerfile.cpu` (CPU-only).
-Config (env): `MODEL_SIZE`, `DEVICE` (`cuda`/`cpu`), `COMPUTE_TYPE`, `CPU_THREADS` and
-`API_TOKEN` are set in the deploy unit's `.env.example`. The worker also reads the knobs below
+Config (env): `MODEL_SIZE`, `COMPUTE_TYPE` (GPU only), `CPU_THREADS` and `API_TOKEN` are set
+in the deploy unit's `.env.example`; `DEVICE` (`cuda`/`cpu`) is fixed by the compose file you run. The worker also reads the knobs below
 (defaults from `src/transcription/main.py`). The deploy unit's compose files do not forward them
 (only `VAD_MIN_SILENCE_DURATION_MS` on GPU), so to change one there, add it to the worker's
 `environment:` list.
