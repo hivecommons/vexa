@@ -14,9 +14,6 @@ A Next.js web application that provides:
 - User/token management: create API keys, configure webhooks
 - Admin analytics: user and meeting statistics
 
-### Documentation
-- [Dashboard UI](../../docs/ui-dashboard.mdx)
-
 ### Dependencies
 
 - **api-gateway** -- all API calls route through the gateway
@@ -150,12 +147,6 @@ All backend calls validated from inside the dashboard container:
 - GET: gateway root → 200, /meetings → 401 (correct — needs auth), /bots/status → 401, admin /users → 200, agent-api health → 200, internal auth → 200
 - POST: /api/vexa/bots (browser_session) → 201, /api/vexa/bots (meeting join) → 201
 - Dashboard serving on port 3001 (dev) / 3000 (production Docker)
-
-## Screenshots
-
-![Dashboard](docs/screenshots/01-dashboard.png)
-![Join Meeting](docs/screenshots/02-join-meeting.png)
-![Live Transcript](docs/screenshots/06-live-transcript.png)
 
 ## Related
 
