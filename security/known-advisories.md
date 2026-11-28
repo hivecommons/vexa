@@ -13,10 +13,10 @@ file beside each lockfile.
 
 | Advisory | Package | Severity | Why it is accepted | Review by |
 |---|---|---|---|---|
-| [GHSA-hp3w-g68c-fv3c](https://osv.dev/GHSA-hp3w-g68c-fv3c) | `sprintf-js` 1.1.3 | Medium | No fixed release exists. Reached only through `roarr` ← `global-agent` ← `onnxruntime-node`, which formats its own log lines while its postinstall downloads the ONNX runtime; no request data reaches it. | 2026-12-31 |
 | [GHSA-238p-pmpm-9mq7](https://osv.dev/GHSA-238p-pmpm-9mq7) | `katex` 0.16.47 | Low | A trust bypass that needs prototype pollution to exist already. Reached through `mermaid` in the terminal's diagram rendering; the fix (0.18.2) is outside mermaid 11's `^0.16` range. | 2026-12-31 |
 | [GHSA-vfj7-8cjw-p6xm](https://osv.dev/GHSA-vfj7-8cjw-p6xm) | `braces` 3.0.3 (`services/dashboard`) | High | No fixed release exists. A dev dependency only (`eslint-config-next` → `@next/eslint-plugin-next` → `fast-glob` → `micromatch`), run at lint time over the repository's own globs; not in the dashboard image. | 2026-12-31 |
-| [GHSA-gcqx-w48m-w2h4](https://osv.dev/GHSA-gcqx-w48m-w2h4) | `deepmerge` 4.3.1 | Medium | No fixed release exists. Reached only through `puppeteer-extra-plugin-user-preferences` ← `puppeteer-extra-plugin-stealth` in the join and remote-browser bots, which merges the stealth plugins' own fixed Chrome preferences; Vexa passes no `userPrefs`, so no request data reaches it. | 2026-12-31 |
+| [GHSA-g3hv-75wg-m249](https://osv.dev/GHSA-g3hv-75wg-m249) | `minimatch` 10.2.6 (`services/dashboard`) | Medium | Fixed only in 11.0.1, a major outside its parent's range: a dev-only transitive dependency of `@typescript-eslint/typescript-estree` (through `eslint-config-next` → `typescript-eslint`), which requires `minimatch ^10.2.2`. Run at lint time over the repository's own globs; not in the dashboard image. Revisit when upstream bumps. | 2027-01-25 |
+| [GHSA-474x-hrwr-fgx4](https://osv.dev/GHSA-474x-hrwr-fgx4) | `fast-xml-parser` 5.7.3 (`services/dashboard`) | Low | Fixed in 5.12.0, which its parent does not admit: a dev-only transitive dependency pinned exactly to 5.7.3 by `@aws-sdk/xml-builder` 3.972.24 (through `@aws-sdk/core`). Later `@aws-sdk/xml-builder` releases drop `fast-xml-parser`, so this clears with the next AWS SDK bump. Not in the dashboard image. | 2027-01-25 |
 
 ### adm-zip (the advisory the report left open)
 

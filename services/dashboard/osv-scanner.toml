@@ -5,3 +5,13 @@
 id = "GHSA-vfj7-8cjw-p6xm"
 ignoreUntil = 2026-12-31
 reason = "braces 3.0.3, stack exhaustion on deeply nested patterns; no fixed release exists. A dev dependency only (eslint-config-next -> @next/eslint-plugin-next -> fast-glob -> micromatch), run at lint time over the repository's own globs; it is not in the dashboard image."
+
+[[IgnoredVulns]]
+id = "GHSA-g3hv-75wg-m249"
+ignoreUntil = 2027-01-25
+reason = "minimatch 10.2.6, fixed only in 11.0.1 (a major). Dev-only transitive; parent requires minimatch ^10 (@typescript-eslint/typescript-estree via eslint-config-next -> typescript-eslint, ^10.2.2), run at lint time over the repository's own globs; not in the dashboard image. Revisit when upstream bumps."
+
+[[IgnoredVulns]]
+id = "GHSA-474x-hrwr-fgx4"
+ignoreUntil = 2027-01-25
+reason = "fast-xml-parser 5.7.3, fixed in 5.12.0. Dev-only transitive; parent pins it exactly (@aws-sdk/xml-builder 3.972.24 via @aws-sdk/core requires 5.7.3), so 5.12.0 is outside its range; later @aws-sdk/xml-builder releases drop fast-xml-parser. Not in the dashboard image. Revisit when the AWS SDK is bumped."
